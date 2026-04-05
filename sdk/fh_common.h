@@ -78,6 +78,104 @@ typedef struct {
     char      cpu_type[32];  /* [512] SoC name: "fh8852v201" */
 } FH_DEVICE_INFO;
 
+/**
+ * Hardware info struct (hwinfo).
+ * Referenced as `hwinfo[]` throughout the binary.
+ * Populated from /usr/app/product, /tmp/etc/config/hw.conf,
+ * license data, and sensor probing.
+ *
+ * Decompiled field-by-field from:
+ *   m_platform_sync_product_info (offsets 136-144)
+ *   sysctrl_read_hw_config (offsets 295-356)
+ *   sysctrl_read_double_sensor_config (offset 373)
+ *   p_image_get_sensor_id (offset 220)
+ *   _media_driver_config / FUN_00295168 (offsets 216, 228-256)
+ *   cloud_p2p_start (offset 212)
+ *   p_platform_gpio_init (offsets 288, 300, 332, 336, 373)
+ *   m_osd_init (offset 348)
+ *
+ * Size: ~380 bytes (0x17C)
+ */
+typedef struct {
+    FH_UINT8  pad0[136];             /* [0x00-0x87] Unknown/reserved */
+
+    /* From /usr/app/product file */
+    FH_UINT32 uboot_version_num;     /* [0x88] Product uboot version number */
+    FH_UINT32 kernel_version_num;    /* [0x8C] Product kernel version number */
+    FH_UINT32 rootfs_version_num;    /* [0x90] Product rootfs/appfs version number */
+
+    FH_UINT8  pad1[64];             /* [0x94-0xD3] Unknown */
+
+    /* From license/authentication */
+    FH_UINT32 p2p_type;             /* [0xD4] P2P cloud type (1=Tuya,2=Dana,3=HuiYun,4=XiaoCao,
+                                              5=QIPC,6/9=Closeli,7=IVY,8=Aliyun,10=Halou) */
+
+    /* Video configuration */
+    FH_UINT32 chn_num;              /* [0xD8] Number of sensor channels (1 or 2) */
+    FH_UINT32 sensor_type;          /* [0xDC] Sensor ID (1=imx307,3=gc2053,6=gc2093,
+                                              7=gc2063,11=gc2083,20=cv2003) */
+    FH_UINT8  pad2[4];             /* [0xE0] */
+    FH_UINT32 isp_width;           /* [0xE4] ISP processing width */
+    FH_UINT32 isp_height;          /* [0xE8] ISP processing height */
+    FH_UINT8  pad3[8];             /* [0xEC] */
+    FH_UINT32 vi_width;            /* [0xF4] Video input width (1920) */
+    FH_UINT32 vi_height;           /* [0xF8] Video input height (1080) */
+    FH_UINT32 cap0_width;          /* [0xFC] Capture channel 0 width */
+    FH_UINT32 cap0_height;         /* [0x100] Capture channel 0 height */
+
+    FH_UINT8  pad4[16];            /* [0x104-0x113] */
+    FH_UINT32 msg_queue;           /* [0x114] System message queue handle */
+
+    FH_UINT8  pad5[8];             /* [0x118-0x11F] */
+    FH_UINT32 has_wifi;            /* [0x120] WiFi module present (0 or 1) */
+
+    FH_UINT8  pad6[3];             /* [0x124-0x126] */
+
+    /* From hw.conf — byte fields */
+    FH_UINT8  af_protocol;         /* [0x127] Autofocus protocol type */
+    FH_UINT8  ptz_h_convert;       /* [0x128] PTZ horizontal direction invert */
+    FH_UINT8  ptz_v_convert;       /* [0x129] PTZ vertical direction invert */
+    FH_UINT8  ir_lamp_level;       /* [0x12A] IR lamp polarity (inverts PWM if set) */
+    FH_UINT8  white_lamp_level;    /* [0x12B] White lamp polarity */
+    FH_UINT8  ircut_convert;       /* [0x12C] IR-cut filter direction invert */
+    FH_UINT8  speaker_level;       /* [0x12D] Speaker polarity */
+    FH_UINT8  photoresistor_type;  /* [0x12E] Photoresistor type (0=GPIO, 1=ADC) */
+    FH_UINT8  photoresistor_level; /* [0x12F] Photoresistor polarity */
+    FH_UINT8  hw_change_lamp_mode; /* [0x130] Hardware lamp mode change enable */
+
+    FH_UINT8  pad7[3];             /* [0x131-0x133] */
+
+    /* From hw.conf — uint32 fields */
+    FH_UINT32 max_ptz_h_step;     /* [0x134] Max PTZ horizontal steps (e.g. 3150) */
+    FH_UINT32 max_ptz_v_step;     /* [0x138] Max PTZ vertical steps (e.g. 1200) */
+    FH_UINT32 ptz_h_speed;        /* [0x13C] PTZ horizontal speed (e.g. 2000000) */
+    FH_UINT32 ptz_v_speed;        /* [0x140] PTZ vertical speed (e.g. 3000000) */
+    FH_UINT32 ptz_move_volume;    /* [0x144] PTZ movement audio volume (e.g. 80) */
+    FH_UINT32 ptz_track_mode;     /* [0x148] PTZ tracking mode */
+    FH_UINT32 custom_io_func1;    /* [0x14C] IR lamp GPIO type (1=GPIO,2=PWM,3=direct,4=ext) */
+    FH_UINT32 custom_io_func2;    /* [0x150] White lamp GPIO type */
+
+    FH_UINT8  pad8[4];            /* [0x154-0x157] */
+
+    /**
+     * System function hardware bitmask (from hw.conf flags).
+     * Built by ORing bits from individual hw.conf keys:
+     *   bit 4  (0x10):    PTZ support (ptz_support=1)
+     *   bit 6  (0x40):    GB28181 support
+     *   bit 7  (0x80):    IR lamp present (custom_io_func1=0 or 3)
+     *   bit 8  (0x100):   Dual lamp (double_lamp_support=1)
+     *   bit 15 (0x8000):  Cloud support (cloud_support=1, requires p2p_type)
+     *   bit 16 (0x10000): ONVIF image control (onvif_set_image_support=1)
+     */
+    FH_UINT32 sys_function_hw;    /* [0x158] Hardware feature bitmask */
+
+    FH_UINT8  pad9[8];            /* [0x15C-0x163] */
+    FH_UINT32 af_protocol_ext;    /* [0x164] af_protocol & 0xFF (extended) */
+
+    FH_UINT8  pad10[13];          /* [0x168-0x174] */
+    FH_UINT8  sensor_index;       /* [0x175] Dual sensor active index (0 or 1) */
+} FH_HWINFO;
+
 /* Error codes (observed in decompilation) */
 #define FH_ERR_VENC_BASE    0xA1024000
 #define FH_ERR_VENC_PARAM   0xA1024003  /* invalid channel number */
