@@ -33,6 +33,51 @@ typedef int             FH_BOOL;
 #define FH_MAX_ACCOUNTS     10  /* m_account_check_auth: local_10 < 10 */
 #define FH_ACCOUNT_SIZE     0x48 /* bytes per account entry */
 
+/* ================================================================
+ * Structs validated from live memory dumps (runtime verification)
+ * Dumped from /proc/234/mem of running ipcam process
+ * ================================================================ */
+
+/**
+ * Account entry (validated from live memory at 0x660408).
+ * 10 entries, 0x48 bytes each.
+ */
+typedef struct {
+    char      name[0x20];    /* [0x00] Username, null-terminated */
+    char      password[0x20];/* [0x20] Password in PLAINTEXT, null-terminated */
+    FH_UINT32 type;          /* [0x40] Account type (0 = admin) */
+    FH_UINT32 power;         /* [0x44] Permission flags (0xFFFFFFFF = full access) */
+} FH_ACCOUNT;
+
+/**
+ * Device information struct (validated from live memory at 0x658800).
+ * This is the struct returned by mod=device&cmd=get.
+ * Total size: ~544 bytes.
+ */
+typedef struct {
+    FH_UINT32 unknown0;      /* [  0] */
+    FH_UINT8  pad1[12];      /* [  4] */
+    char      devtype[32];   /* [ 16] Device type: "H43" */
+    char      uboot_ver[48]; /* [ 48] U-Boot version: "uboot-2016-14" */
+    char      kernel_ver[48];/* [ 96] Kernel version: "linux-4.9-15" */
+    char      version[48];   /* [144] Firmware version: "V1.14.48-20240903" */
+    char      devno[64];     /* [192] P2P device number: "PPXCAO0AA55FD6CC15" */
+    char      serial[32];    /* [256] Serial number: "989FEA22D1F1F9AF" */
+    char      nickname[64];  /* [288] Device nickname: "H43" */
+    char      chn_name[64];  /* [352] Channel name: "Channel0" */
+    char      manufacturer[32]; /* [416] Manufacturer: "Vatilon" */
+    char      location[32];  /* [448] Location: "ShenZhen" */
+    FH_UINT32 language;      /* [480] Language: 1 */
+    FH_UINT32 timezone;      /* [484] Timezone: 27 */
+    FH_UINT32 voice;         /* [488] Voice prompt type: 2 */
+    FH_UINT32 chn_num;       /* [492] Number of channels: 1 */
+    FH_UINT32 reserved;      /* [496] */
+    FH_UINT32 system_function; /* [500] Feature bitmask: 0x3ABCB (240587) */
+    FH_UINT32 home_ipc;      /* [504] Home IPC flag: 1 */
+    FH_UINT32 stream_num;    /* [508] Streams per channel: 2 */
+    char      cpu_type[32];  /* [512] SoC name: "fh8852v201" */
+} FH_DEVICE_INFO;
+
 /* Error codes (observed in decompilation) */
 #define FH_ERR_VENC_BASE    0xA1024000
 #define FH_ERR_VENC_PARAM   0xA1024003  /* invalid channel number */
