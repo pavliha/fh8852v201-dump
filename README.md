@@ -155,6 +155,78 @@ init → /usr/app/run.sh
 | 2360 | Telnet (BusyBox ash) |
 | 9101 | WebSocket (video player) |
 
+## RTSP URL Format (decompiled)
+
+```
+rtsp://<ip>:<port>/stream<N>
+```
+
+Where `N` = channel + 1. Default port from `DAT_0066081c` (554).
+- `rtsp://<ip>:554/stream1` — main stream (channel 0)
+- `rtsp://<ip>:554/stream2` — sub stream (channel 1)
+
+## Watchdog (decompiled)
+
+```
+Device: /dev/watchdog
+Timeout: 30 seconds (0x1E)
+Mode: 2 (auto-reset on timeout)
+
+IOCTL codes:
+  0xC0045706  — Set timeout (WDIOC_SETTIMEOUT)
+  0x80045704  — Set options (WDIOC_SETOPTIONS)
+  0x80045705  — Keepalive/feed (WDIOC_KEEPALIVE)
+```
+
+If `ipcam` crashes or hangs (stops calling `m_wdt_feed()`), the hardware watchdog reboots the camera after 30 seconds. The `run.sh` script also reboots if `ipcam` exits normally.
+
+## Cellular/4G Support (decompiled)
+
+The camera supports cellular modems when `hwinfo[0x15c] & 8` is set:
+- Detects SIM card (dual SIM support, tries both slots)
+- Configures modem via AT commands
+- Falls back between SIM 0 and SIM 1
+- Modem accessed via `/dev/ttyUSB*` or similar
+
+## Firmware Recovery Format (decompiled from `m_firmware_backup`)
+
+The camera creates a recovery ROM on SD card at `<sdcard>/<product>_recovery.rom`.
+
+```
+Recovery ROM layout:
+  [0x00] Magic: 0x48465548 ("HFUH" — reversed "HUFH")
+  [0x04] Version: 0xA0000001
+  [0x08] Header CRC32 (calculated over 0x220 bytes)
+  [0x0C] Build date string
+  [0x18] Firmware version number (parsed from "V1.14.48")
+  [0x1C] Partition count: 1
+  [0x20] Product name (16 bytes)
+  [0x30] Flash type: "flash"
+
+  Partition table (8 entries × 0x38 bytes each):
+    [+0x00] Name (8 bytes): "uboot", "kernel", "appfs"
+    [+0x08] MTD device (32 bytes): "/dev/mtd0", etc.
+    [+0x28] Flash offset
+    [+0x2C] Size
+    [+0x30] Version number
+    [+0x34] Valid flag (1)
+
+  Data: raw MTD partition dumps concatenated
+  CRC32 of all data appended
+```
+
+The recovery skips "custom" and "config" partitions — only backs up uboot, kernel, and appfs. Data is read from `/dev/mtdN` in 64KB blocks with `utl_calc_crc32`.
+
+## System Reset (decompiled)
+
+```
+system_reset(0) → sends message 0x102 (soft reset, keep config)
+system_reset(1) → sends message 0x103 (factory reset, clear config)
+system_reboot() → sends message 0x100 (reboot)
+```
+
+All via `utl_msg_queue_push(hwinfo._276_4_, msg_id, 0, 1)` — the system message queue at hwinfo offset 276.
+
 ## UART Console
 
 ```
