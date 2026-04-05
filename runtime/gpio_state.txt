@@ -1,0 +1,21 @@
+# Live GPIO state from running KEVIEW H43 (P05H)
+# Dumped from /sys/class/gpio/
+# Camera was in day mode (IR off, color image)
+
+GPIO  Dir  Value  Function (from Ghidra decompilation)
+----  ---  -----  ----------------------------------------
+  0   out    0    IR LED 1 control (off)
+  1   out    0    IR LED 2 control (off)
+  2   in     1    Photoresistor / ADC input (day detected)
+  3   in     1    Light sensor input (bright)
+ 13   out    1    Sensor reset (active high = running)
+ 26   out    1    IR-cut filter direction (day position)
+ 39   in     1    IR LED status feedback
+ 40   out    0    Speaker enable (off)
+
+# GPIO chip layout:
+# gpiochip0:  GPIO 0-31 (bank 0, at 0xF0300000)
+# gpiochip32: GPIO 32-63 (bank 1, at 0xF4000000)
+
+# Note: PWM channels (for IR/white LED brightness) are not GPIO-exported.
+# PWM controller at 0xF0400000 handles duty cycle for LED dimming.
