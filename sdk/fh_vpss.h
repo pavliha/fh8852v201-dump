@@ -70,6 +70,42 @@ typedef struct {
     FH_SINT32 strength;    /* Correction strength (0-100, default 50) */
 } FH_VPSS_LDC_ATTR;
 
+/**
+ * Video frame from VPSS channel.
+ * Retrieved via ioctl VPSS_IOCTL_GET_FRAME (0xC0686970).
+ *
+ * Decompiled from FH_VPSS_GetChnFrame_Ex:
+ *   ioctl returns raw buffer, then fields are mapped to output struct:
+ *     param_2[0]  = local_118[2]   → phys_addr (Y plane physical address)
+ *     param_2[1]  = local_104      → format (pixel format)
+ *     param_2[2]  = local_118[3]   → width
+ *     param_2[3]  = local_108      → height
+ *     param_2[4]  = local_100      → stride_y (Y plane stride)
+ *     param_2[5]  = uStack_fc      → stride_c (C plane stride)
+ *     param_2[6]  = uStack_f8      → size (total frame size)
+ *     param_2[7]  = local_f4       → phys_addr_c (C plane physical address)
+ *     param_2[8]  = local_f0       → virt_addr (Y plane virtual address)
+ *     param_2[9]  = local_ec       → virt_addr_c (C plane virtual address)
+ *     param_2[10] = local_d8       → pts_lo (timestamp low)
+ *     param_2[11] = local_d4       → pts_hi (timestamp high)
+ */
+typedef struct {
+    FH_UINT32 phys_addr;    /* [0]  Y plane physical address */
+    FH_UINT32 format;       /* [1]  Pixel format */
+    FH_UINT32 width;        /* [2]  Frame width */
+    FH_UINT32 height;       /* [3]  Frame height */
+    FH_UINT32 stride_y;     /* [4]  Y plane stride (bytes per line) */
+    FH_UINT32 stride_c;     /* [5]  C plane stride */
+    FH_UINT32 size;         /* [6]  Total frame data size */
+    FH_UINT32 phys_addr_c;  /* [7]  C plane physical address */
+    FH_UINT32 virt_addr;    /* [8]  Y plane virtual address (mmap'd) */
+    FH_UINT32 virt_addr_c;  /* [9]  C plane virtual address */
+    FH_UINT32 pts_lo;       /* [10] Presentation timestamp (low 32) */
+    FH_UINT32 pts_hi;       /* [11] Presentation timestamp (high 32) */
+} FH_VPSS_FRAME;
+
+#define VPSS_IOCTL_GET_FRAME    0xC0686970  /* FH_VPSS_GetChnFrame_Ex */
+
 /* ---- API Functions ---- */
 
 /**

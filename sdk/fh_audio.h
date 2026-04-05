@@ -12,6 +12,84 @@
 
 #include "fh_common.h"
 
+/* ---- IOCTL codes ---- */
+#define AC_IOCTL_RESET      0x40000000  /* Reset audio codec */
+#define AC_IOCTL_COMMAND    0x20000000  /* Configure / get frame / send frame */
+
+/* ---- Structures ---- */
+
+/**
+ * Audio configuration.
+ * Passed via ioctl AC_IOCTL_COMMAND.
+ *
+ * From FH_AC_Init decompilation:
+ *   config[0] = 0x18  (command size?)
+ *   config[1] = 0x18  (?)
+ *   config[2] = 0x18  (?)
+ *   config[3] = 0x1040004  → audio format:
+ *     bits 0-7:   sample format (4 = 16-bit PCM)
+ *     bits 16-23: channels (4 = ?)
+ *     bits 24-31: rate index (1 = 8kHz?)
+ *
+ * From FH_AC_AO_SendFrame:
+ *   config[3] = 0x1008002  → output format
+ */
+typedef struct {
+    FH_UINT32 cmd_size;     /* Command header size (0x18) */
+    FH_UINT16 param1;       /* Parameter 1 (0x18) */
+    FH_UINT16 param2;       /* Parameter 2 (varies) */
+    FH_UINT32 format;       /* Audio format bitfield */
+    FH_SINT32 status;       /* Return status (0 = success) */
+    FH_UINT32 data_size;    /* Data size / buffer offset */
+    FH_UINT32 phys_addr;    /* Physical address of DMA buffer */
+} FH_AC_CONFIG;
+
+/**
+ * Audio input frame.
+ * Retrieved via FH_AC_AI_GetFrameWithPts / GetFrameWithPtsFast.
+ *
+ * From FH_AC_AI_GetFrameWithPtsFast decompilation:
+ *   param_1[0] = data_size   (bytes of audio data)
+ *   param_1[1] = data_ptr    (pointer to PCM data, mmap'd from shared memory)
+ *
+ * From FH_AC_AI_GetFrameWithPts:
+ *   Copies data from shared mmap region into user buffer.
+ *   param_1[0] = size, param_1[1] = user buffer pointer
+ */
+typedef struct {
+    FH_UINT32 size;         /* Audio data size in bytes */
+    FH_VOID  *data;         /* Pointer to PCM audio data */
+} FH_AC_AI_FRAME;
+
+/**
+ * Audio input frame with timestamp.
+ * Used with FH_AC_AI_GetFrameWithPtsFast.
+ *
+ * From decompilation: pts is 64-bit (two uint32s).
+ */
+typedef struct {
+    FH_UINT32 pts_lo;       /* Timestamp low 32 bits */
+    FH_UINT32 pts_hi;       /* Timestamp high 32 bits */
+} FH_AC_PTS;
+
+/**
+ * Audio output frame.
+ * Sent via FH_AC_AO_SendFrame.
+ *
+ * From FH_AC_AO_SendFrame decompilation:
+ *   param_1[0] = size    (must be >0, even, <= max buffer size)
+ *   param_1[1] = data    (pointer to PCM data, copied to mmap'd output buffer)
+ *
+ * Constraints:
+ *   - size must be non-zero
+ *   - size must be even (size & 1 == 0)
+ *   - size must fit in output buffer
+ */
+typedef struct {
+    FH_UINT32 size;         /* Audio data size in bytes (must be even) */
+    FH_VOID  *data;         /* Pointer to PCM audio data */
+} FH_AC_AO_FRAME;
+
 /* ---- Initialization ---- */
 
 /**

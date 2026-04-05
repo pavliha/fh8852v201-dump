@@ -32,15 +32,65 @@ typedef struct {
 } FH_VENC_CHN_ATTR;
 
 /**
- * Encoded stream output.
- * From FH_VENC_GetStream → fh_venc_handle_stream.
+ * Encoded stream NAL unit.
+ * Array of these in FH_VENC_STREAM, count = nalu_count.
+ * From _VENC_HandleStream: 3 uint32s per NAL, packed at param_2[8..].
  */
 typedef struct {
-    FH_UINT32 chn;          /* Channel index */
-    /* Remaining fields populated by fh_venc_handle_stream */
-    /* Includes: data pointer, size, pts, frame type, etc. */
-    FH_UINT32 reserved[104]; /* 105 uint32s total buffer (from local_1b0[105]) */
+    FH_UINT32 addr;         /* [+0x00] Physical/virtual address of NAL data */
+    FH_UINT32 type;         /* [+0x04] NAL unit type (SPS/PPS/IDR/P-frame etc.) */
+    FH_UINT32 length;       /* [+0x08] NAL unit size in bytes */
+} FH_VENC_NALU;
+
+/**
+ * Encoded stream output.
+ * Populated by fh_venc_handle_stream → _VENC_HandleStream / _JPEG_HandleStream.
+ * Retrieved via ioctl 0xC1A04D05 on /dev/media_process.
+ *
+ * Layout decompiled from _VENC_HandleStream (H.264/H.265):
+ *   [0]  type        — codec type (4=H.264, 8=H.265)
+ *   [1]  chn         — channel index
+ *   [2]  total_size  — total encoded data size
+ *   [3]  frame_type  — I-frame / P-frame / B-frame
+ *   [4]  pts_lo      — presentation timestamp (low 32 bits)
+ *   [5]  dts_lo      — decode timestamp (low 32 bits)
+ *   [6]  dts_hi      — decode timestamp (high 32 bits)
+ *   [7]  nalu_count  — number of NAL units
+ *   [8..] nalus      — array of FH_VENC_NALU (3 uint32s each × nalu_count)
+ *   [0x44] seq_num   — sequence number
+ *   [0x45..0x4B]     — encoder statistics (QP, bitrate, etc.)
+ *   [0x4C..0x4D]     — framerate (as double, from hw tick / clock)
+ *   [0x4E] width     — encoded width
+ *   [0x4F] height    — encoded height
+ *
+ * Layout for JPEG (_JPEG_HandleStream):
+ *   [0]  type        — 1=JPEG snapshot, 2=MJPEG
+ *   [1]  chn         — channel index
+ *   [2]  data_addr   — JPEG data address
+ *   [3]  data_size   — JPEG data size in bytes
+ *   [4]  pts_lo      — presentation timestamp
+ *   [5]  width       — image width
+ *   [6]  height      — image height
+ */
+typedef struct {
+    FH_UINT32 type;         /* [0x00] Codec: 1=JPEG, 2=MJPEG, 4=H.264, 8=H.265 */
+    FH_UINT32 chn;          /* [0x04] Channel index */
+    FH_UINT32 total_size;   /* [0x08] Total encoded data size (VENC) / data addr (JPEG) */
+    FH_UINT32 frame_type;   /* [0x0C] Frame type (VENC) / data size (JPEG) */
+    FH_UINT32 pts_lo;       /* [0x10] PTS low 32 bits */
+    FH_UINT32 dts_lo;       /* [0x14] DTS low (VENC) / width (JPEG) */
+    FH_UINT32 dts_hi;       /* [0x18] DTS high (VENC) / height (JPEG) */
+    FH_UINT32 nalu_count;   /* [0x1C] Number of NAL units (H.264/H.265 only) */
+    FH_VENC_NALU nalus[18]; /* [0x20] NAL unit array (max 18, 3×uint32 each) */
+    FH_UINT32 seq_num;      /* [0x110] Sequence number */
+    FH_UINT32 stat[6];      /* [0x114] Encoder stats (QP, bitrate, etc.) */
+    double    framerate;    /* [0x130] Measured frame rate */
+    FH_UINT32 enc_width;    /* [0x138] Encoded width */
+    FH_UINT32 enc_height;   /* [0x13C] Encoded height */
 } FH_VENC_STREAM;
+
+/* IOCTL for getting stream from /dev/media_process */
+#define VENC_IOCTL_GET_STREAM   0xC1A04D05  /* _fh_sys_get_stream */
 
 /* ---- API Functions ---- */
 
