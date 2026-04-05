@@ -171,13 +171,112 @@ FH_UINT32 FH_VENC_GetCurPts(FH_UINT32 chn);
  */
 FH_SINT32 FH_VENC_GetChnStatus(FH_UINT32 chn, /* status */);
 
+/* ---- VENC IOCTL codes ---- */
+#define VENC_IOCTL_CREATE_CHN   0xC01C5403  /* _VENC_CreateChn */
+#define VENC_IOCTL_SET_RC       0xC06C540C  /* _VENC_SetRCAttr */
+
+/* ---- Rate Control Types (from _VENC_SetRCAttr switch) ---- */
+#define FH_RC_CBR_H264      3   /* CBR for H.264 */
+#define FH_RC_VBR_H264      4   /* VBR for H.264 */
+#define FH_RC_FIXQP_H264    5   /* Fixed QP for H.264 */
+#define FH_RC_AVBR_H264     6   /* AVBR for H.264 */
+#define FH_RC_CBR_H265      7   /* CBR for H.265 */
+#define FH_RC_VBR_H265      8   /* VBR for H.265 */
+#define FH_RC_FIXQP_H265    9   /* Fixed QP for H.265 */
+#define FH_RC_AVBR_H265     10  /* AVBR for H.265 */
+#define FH_RC_CVBR_H264     11  /* CVBR for H.264 */
+#define FH_RC_CVBR_H265     12  /* CVBR for H.265 */
+#define FH_RC_QVBR_H264     13  /* QVBR for H.264 */
+#define FH_RC_QVBR_H265     14  /* QVBR for H.265 */
+
+/**
+ * Rate control attributes.
+ * Decompiled from _VENC_SetRCAttr — the struct layout varies by RC type,
+ * but all types share the same first fields and are converted to a common
+ * internal format (27 uint32s) before ioctl.
+ *
+ * Common CBR fields (type 3/7):
+ *   [0] type          — RC type (FH_RC_*)
+ *   [1] bitrate       — Target bitrate in kbps
+ *   [2] max_bitrate   — Max bitrate (VBR) or same as bitrate (CBR)
+ *   [3] gop           — GOP size (I-frame interval)
+ *   [4] max_qp        — Maximum QP (default 200 for CBR)
+ *   [5] min_qp        — Minimum QP (default 0)
+ *   [6] qp_delta      — QP delta (default -2 for CBR)
+ *   [7] stat_time     — Statistics time window
+ *   [8] max_i_size    — Max I-frame size multiplier
+ *   [9] reserved      — Reserved
+ *
+ * VBR adds (type 4/8):
+ *   [3] max_rate_percent  — Max rate percent
+ *   [7] i_qp_delta       — I-frame QP delta
+ *   [8] change_pos        — Quality change position
+ *   [9] min_i_ratio       — Min I-frame ratio
+ *
+ * AVBR adds (type 6/10):
+ *   [3..6] qp_range      — QP range per frame type
+ *   [11..13] adv_params   — Advanced VBR tuning
+ *   [14] min_qp_i         — Min QP for I-frames
+ *   [15] max_qp_i         — Max QP for I-frames
+ *
+ * FixedQP (type 5/9):
+ *   [1] i_qp       — I-frame QP
+ *   [2] p_qp       — P-frame QP
+ *   [3] gop        — GOP size
+ *
+ * Internal ioctl struct (27 uint32s at 0xC06C540C):
+ *   [0]  channel
+ *   [1]  rc_mode (0=CBR_ext, 1=VBR, 2=FixQP, 4=AVBR, 5=CVBR, 6=QVBR)
+ *   [2]  unused (0)
+ *   [3]  bitrate
+ *   [4]  max_bitrate
+ *   [5]  min_bitrate
+ *   [6]  max_i_bitrate
+ *   [7]  framerate_num
+ *   [8]  framerate_den
+ *   [9]  gop
+ *   [10] stat_time (8)
+ *   [11] max_qp
+ *   [12] min_qp
+ *   [13] max_i_qp (default 0x1E=30)
+ *   [14] min_i_qp (default 0x1E=30)
+ *   [15] max_qp_delta (default 0x22=34)
+ *   [16] change_pos (default 0x20=32)
+ *   [17] qp_delta
+ *   [18] min_qp_i_delta (default 0x1E=30)
+ *   [19] min_still_bitrate (default 2000)
+ *   [20] max_still_bitrate (default 4000)
+ */
+typedef struct {
+    FH_UINT32 type;             /* [0] RC type (FH_RC_*) */
+    FH_UINT32 bitrate;          /* [1] Target/max bitrate (kbps) */
+    FH_UINT32 max_bitrate;      /* [2] Max bitrate (VBR) */
+    FH_UINT32 gop;              /* [3] GOP size */
+    FH_UINT32 field4;           /* [4] Varies by RC type */
+    FH_UINT32 field5;           /* [5] Varies by RC type */
+    FH_UINT32 field6;           /* [6] Varies by RC type */
+    FH_UINT32 stat_time;        /* [7] Statistics window */
+    FH_UINT32 max_qp;           /* [8] or field8 */
+    FH_UINT32 min_qp;           /* [9] or field9 */
+    FH_UINT32 qp_delta;         /* [10] */
+    FH_UINT32 i_qp_delta;       /* [11] */
+    FH_UINT32 change_pos;       /* [12] */
+    FH_UINT32 min_i_ratio;      /* [13] */
+    FH_UINT32 min_qp_i;         /* [14] AVBR/QVBR */
+    FH_UINT32 max_qp_i;         /* [15] AVBR/QVBR */
+    FH_UINT32 reserved[1];      /* [16] */
+} FH_VENC_RC_ATTR;
+
 /* ---- Rate Control ---- */
 
 /**
- * Set rate control attributes (CBR/VBR, bitrate, GOP, etc.).
+ * Set rate control attributes.
+ * Internally converts to 27-uint32 struct and calls ioctl 0xC06C540C.
+ * @param chn      Channel 0-8
+ * @param rc_attr  Rate control configuration
  */
-FH_SINT32 FH_VENC_SetRCAttr(FH_UINT32 chn, /* rc_attr */);
-FH_SINT32 FH_VENC_GetRCAttr(FH_UINT32 chn, /* rc_attr */);
+FH_SINT32 FH_VENC_SetRCAttr(FH_UINT32 chn, const FH_VENC_RC_ATTR *rc_attr);
+FH_SINT32 FH_VENC_GetRCAttr(FH_UINT32 chn, FH_VENC_RC_ATTR *rc_attr);
 
 /**
  * Dynamic rate control parameter change.

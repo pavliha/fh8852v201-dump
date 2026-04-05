@@ -17,6 +17,168 @@
 #include "fh_common.h"
 
 /* ================================================================
+ * ISP Register Map (from isp_core_get_param_addr offsets)
+ *
+ * ISP parameters are stored in a memory-mapped register block.
+ * Each API_ISP_Get*Cfg function reads from specific offsets.
+ * These offsets define the ISP hardware register layout:
+ *
+ *   0x0010-0x0011  Global flags (color mode, mirror, enable bits)
+ *   0x002C-0x00FF  Auto-exposure (AE) configuration
+ *   0x03C8-0x044F  3D noise reduction (NR3D)
+ *   0x03E0-0x03FF  NR3D filter params
+ *   0x03FE-0x0410  NR3D LUT tables
+ *   0x04C0-0x04C8  Contrast configuration
+ *   0x04E0-0x0590  Saturation configuration
+ *   0x0590-0x06DC  Gamma curves (2 tables × 80 entries × 2 uint16)
+ *   0x0A9C-0x0AF9  Sharpness (APC) configuration
+ *   0x0F1B-0x0F37  NR3D advanced params
+ * ================================================================ */
+
+/* ================================================================
+ * ISP Structures (from Ghidra decompilation of Get functions)
+ * ================================================================ */
+
+/**
+ * Contrast configuration.
+ * From API_ISP_GetContrastCfg: reads from ISP offset 0x4C0.
+ * Size: ~14 bytes (3.5 uint32s)
+ */
+typedef struct {
+    FH_UINT32 auto_enable;   /* [0]  Bit from global flags 0x11 */
+    FH_UINT32 enable;        /* [1]  Contrast enable (offset 0x4C0 bit 0) */
+    FH_UINT8  strength;      /* [8]  Contrast strength (offset 0x4C4) */
+    FH_UINT8  offset;        /* [9]  Contrast offset (offset 0x4C6) */
+    FH_UINT8  lut[4];        /* [10] Contrast LUT (offset 0x4C8, 4 bytes) */
+} FH_ISP_CONTRAST_CFG;
+
+/**
+ * Gamma configuration.
+ * From API_ISP_GetGammaCfg: reads from ISP offset 0x590.
+ * Contains two gamma curves of 80 entries each (10-bit values).
+ *
+ * Size: 0x158 bytes (86 uint32s)
+ */
+typedef struct {
+    FH_UINT32 auto_enable;   /* [0]  Bit from global flags 0x11 */
+    FH_UINT32 mode;          /* [1]  Gamma mode (bits from offset 0x591) */
+    FH_UINT32 curve_sel;     /* [2]  Curve selection (1 or 2) */
+    FH_UINT32 strength;      /* [3]  Upper nibble of offset 0x590 */
+    FH_UINT16 curve1[160];   /* [4]  Gamma curve 1: 80 pairs of 10-bit values (offset 0x6D8+) */
+    FH_UINT32 curve2_sel;    /* [0x54] Curve 2 selection */
+    FH_UINT32 curve2_mode;   /* [0x55] Curve 2 mode */
+    FH_UINT16 curve2[160];   /* [0x56] Gamma curve 2: 80 pairs (offset 0x598+) */
+} FH_ISP_GAMMA_CFG;
+
+/**
+ * Auto-exposure default configuration.
+ * From API_ISP_GetAeDefaultCfg: reads from ISP offset 0x2C.
+ * Very large struct — packed bitfields from registers.
+ *
+ * Size: 0x1A0 bytes (104 uint32s)
+ *
+ * Key fields:
+ *   [0..14]  AE mode flags (15 individual bits from offsets 0x2C-0x2D)
+ *   [0x14]   AE target (offset 0x30)
+ *   [0x19]   AE speed params (offset 0x66)
+ *   [0x1A..0x3F] AE weight table (64 entries, 4-bit pairs from offset 0x68)
+ *   [0x5A..0x5B] AE luma compensation (offset 0xE8-0xE9)
+ *   [0x5C]   AE integration time max (offset 0xEC, 18-bit)
+ *   [0x5D]   AE gain limits (offset 0xF0)
+ *   [0x5E]   AE anti-flicker (offset 0xF8)
+ *   [0x5F]   AE frequency (offset 0xF8, bits 4+)
+ *   [0x60..0x62] AE exposure limits (offset 0x38-0x42)
+ *   [0x64]   AE ISP digital gain max (offset 0x54, 20-bit)
+ *   [0x67]   AE frame rate (offset 0xF4)
+ */
+typedef struct {
+    FH_UINT32 flags[15];         /* [0x00]  AE mode flags */
+    FH_UINT8  reserved1[12];     /* padding */
+    FH_UINT8  target;            /* [0x50]  AE target luminance */
+    FH_UINT8  speed_up;          /* [0x51]  AE convergence speed up */
+    FH_UINT8  speed_down;        /* [0x52]  AE convergence speed down */
+    FH_UINT8  tolerance;         /* [0x53]  AE tolerance */
+    FH_UINT8  ae_params[12];     /* [0x54]  AE algorithm params */
+    FH_UINT8  speed;             /* [0x5C]  AE speed */
+    FH_UINT8  compensation;      /* [0x5D]  AE compensation */
+    FH_UINT8  flicker_mode;      /* [0x5E]  Anti-flicker (0=50Hz, 1=60Hz) */
+    FH_UINT8  flicker_freq;      /* [0x5F]  Flicker frequency */
+    FH_UINT8  exposure_min;      /* [0x60]  Min exposure */
+    FH_UINT8  exposure_max_h;    /* [0x61]  Max exposure high byte */
+    FH_UINT8  gain_limit[2];     /* [0x62]  Gain limits */
+    FH_UINT16 integration_max;   /* [0x64]  Max integration time */
+    FH_UINT8  weight_table[128]; /* [0x66]  64 weight entries (4-bit each × 2) */
+    FH_UINT8  luma_comp[16];     /* [0x166] Luma compensation table */
+    FH_UINT32 isp_dgain_max;     /* [0x190] ISP digital gain max (20-bit) */
+    FH_UINT16 gain_range[4];     /* [0x194] Gain range limits */
+    FH_UINT16 frame_rate;        /* [0x19C] Target frame rate */
+    FH_UINT8  hist_offset[2];    /* [0x19E] Histogram offset */
+} FH_ISP_AE_DEFAULT_CFG;
+
+/**
+ * 3D Noise Reduction configuration.
+ * From API_ISP_GetNr3dCfg: reads from ISP offset 0x3C8.
+ *
+ * Size: 0xCA bytes (~50 uint32s)
+ */
+typedef struct {
+    FH_UINT32 auto_enable;   /* [0]  Global enable (bit 7 of offset 0x10) */
+    FH_UINT32 enable;        /* [1]  NR3D enable (bit 0 of offset 0x3C8) */
+    FH_UINT32 mode1;         /* [2]  Mode flag 1 (offset 0x3C9) */
+    FH_UINT32 mode2;         /* [3]  Mode flag 2 */
+    FH_UINT32 spatial_en;    /* [4]  Spatial filter enable */
+    FH_UINT32 temporal_en;   /* [5]  Temporal filter enable */
+    FH_UINT8  spatial_str;   /* [6]  Spatial filter strength (3-bit) */
+    FH_UINT32 ref_en;        /* [7]  Reference frame enable */
+    FH_UINT8  motion_str;    /* [8]  Motion threshold (5-bit) */
+    FH_UINT32 adaptive;      /* [9]  Adaptive mode */
+    FH_UINT32 blend_mode;    /* [10] Blend mode */
+    FH_UINT16 max_strength;  /* [11] Max filter strength (10-bit) */
+    FH_UINT8  filter_params[21]; /* Spatial/temporal filter LUT */
+    FH_UINT16 motion_lut[9];    /* Motion detection LUT */
+    /* ... additional packed params from offsets 0xF1B-0xF37 */
+} FH_ISP_NR3D_CFG;
+
+/**
+ * Sharpness (APC - Automatic Picture Control) configuration.
+ * From API_ISP_GetApcCfg: reads from ISP offset 0xA9C.
+ *
+ * Size: 0x8E bytes (~36 uint32s)
+ */
+typedef struct {
+    FH_UINT32 auto_enable;    /* [0]  Global enable (bit from offset 0x11) */
+    FH_UINT32 enable;         /* [1]  APC enable */
+    FH_UINT32 mode_flags[6];  /* [2-7]  6 mode flags */
+    FH_UINT8  edge_params[4]; /* [8]  Edge detection params (offset 0xAA0) */
+    FH_UINT16 thresholds[4];  /* [0x26] 4 threshold values (10-bit, offset 0xAA4) */
+    FH_UINT8  strength_lut[48]; /* Strength LUT per brightness zone */
+    FH_UINT8  detail_params[36]; /* Detail enhancement params */
+} FH_ISP_APC_CFG;
+
+/**
+ * Saturation configuration.
+ * From API_ISP_GetSaturation: reads from ISP offset 0x4E0.
+ *
+ * Size: ~0xC0 bytes
+ */
+typedef struct {
+    FH_UINT32 auto_enable;   /* [0]  Global enable */
+    FH_UINT32 enable;        /* [1]  Saturation enable */
+    FH_UINT8  global_sat;    /* [8]  Global saturation (7-bit signed) */
+    FH_UINT8  offset;        /* [9]  Saturation offset */
+    FH_UINT8  range_min;     /* [10] Min saturation */
+    FH_UINT8  range_max;     /* [11] Max saturation */
+    FH_UINT32 cb_mode;       /* [3]  Cb adjustment mode */
+    FH_UINT32 cr_mode;       /* [4]  Cr adjustment mode */
+    FH_UINT8  cb_gain;       /* [5]  Cb gain */
+    FH_UINT32 hue_enable;    /* [6]  Hue adjustment enable */
+    FH_UINT32 hue_mode;      /* [7]  Hue mode */
+    FH_UINT8  hue_offset;    /* [0x20] Hue offset */
+    FH_UINT8  sat_lut[48];   /* Saturation LUT per brightness zone */
+    FH_UINT8  hue_lut[128];  /* Hue LUT (32 entries × 4 bytes) */
+} FH_ISP_SATURATION_CFG;
+
+/* ================================================================
  * High-Level API (FHAdv_*)
  * ================================================================ */
 
