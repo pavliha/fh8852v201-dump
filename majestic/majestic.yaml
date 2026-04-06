@@ -1,0 +1,96 @@
+# majestic.yaml — OpenIPC Majestic config for Fullhan FH8852V201
+# Camera: KEVIEW H43 (P05H) with CV2003 sensor
+# Generated from reverse-engineered firmware analysis
+
+system:
+  webPort: 80
+  buffer: 1572864           # 1.5MB stream buffer (from _media_driver_config: stm_1572864)
+
+isp:
+  sensorConfig: /etc/sensors/cv2003_mipi-1080p.ini
+  antiFlicker: disabled     # img_anti_flicker_enable=0
+  drc: 128                  # img_drc_strenght=128
+  blkCnt: 1                 # block count
+
+image:
+  mirror: false             # img_mirror=0
+  flip: false               # img_flip=0
+  rotate: 0                 # img_rotate=0
+  contrast: 50              # img_contrast=128 (mapped to 0-100)
+  brightness: 50            # img_brightness=128
+  saturation: 50            # img_saturation=128
+  luminance: auto
+
+nightMode:
+  enabled: true
+  irSensorGpio: 2           # GPIO2 — photoresistor input
+  irSensorInvert: false
+  irCutGpio1: 26            # GPIO26 — IR-cut filter control
+  irCutGpio2: -1
+  backlightPin: -1
+  irOnThreshold: 3          # img_day_night_lux=3
+  irOffThreshold: 3
+
+video0:
+  enabled: true
+  codec: h265               # venc_type0=0 (auto = H.265 on this SoC)
+  size: 1920x1080           # venc_width0 x venc_height0
+  fps: 25                   # venc_framerate0=25
+  bitrate: 810              # venc_bitrate0=810 kbps
+  rcMode: vbr               # venc_rcmode0=1 (VBR)
+  gopSize: 4                # venc_gop0=4 seconds (= 100 frames at 25fps)
+
+video1:
+  enabled: true
+  codec: h265
+  size: 704x576             # venc_width1 x venc_height1
+  fps: 25
+  bitrate: 512
+  rcMode: vbr
+  gopSize: 4
+
+jpeg:
+  enabled: true
+  size: 1920x1080
+  qfactor: 80
+  toChannel: 0
+
+audio:
+  enabled: true             # audio_enable=1
+  inputEnabled: true
+  outputEnabled: true
+  srate: 8000               # aenc_samplerate=8000
+  codec: aac                # aenc_type=4 (AAC)
+  inputVolume: 80           # ai_volume=80
+  outputVolume: 100         # ao_volume=100
+
+osd:
+  enabled: true             # osd_enable=1
+  template: "%d/%m/%Y %H:%M:%S"  # osd_datetime_enable=1
+  font: /usr/share/fonts/truetype/UbuntuMono-Regular.ttf
+  corner: top-left          # osd_datetime_pos=0
+
+rtsp:
+  enabled: true             # rtsp_enable=1
+  port: 554                 # rtsp_port=554
+  auth: true                # rtsp_auth_enable=1
+
+onvif:
+  enabled: true             # onvif_enable=1
+  port: 80                  # onvif_port=80
+
+hls:
+  enabled: true
+
+motionDetect:
+  enabled: false            # md_enable=0
+  sensitivity: 10           # md_sensitivity=10
+
+records:
+  enabled: false
+  path: /mnt/sdcard
+  maxUsage: 90
+
+watchdog:
+  enabled: true
+  timeout: 30               # 30 seconds (from p_wdt_open decompilation)
