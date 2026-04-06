@@ -19,6 +19,8 @@
 #define VPSS_CHN_QUERY     0xC0106967
 #define VPSS_CHN_SET_MEM   0xC0186968
 #define VMM_ALLOC          0xC0506D0A
+#define ISP_INIT           0x690A
+#define ISP_KICK           0x6910
 
 int main(void)
 {
@@ -41,12 +43,13 @@ int main(void)
         if (fd >= 0) { write(fd, c[i][1], strlen(c[i][1])); close(fd); }
     }
 
+    /* Order matters! media_process MUST be opened FIRST */
+    int mp  = open("/dev/media_process", O_RDWR);
     int isp = open("/dev/isp", O_RDWR);
+    int enc = open("/dev/enc", O_RDWR);
+    int jpg = open("/dev/jpeg", O_RDWR);
     int vmm = open("/dev/vmm_userdev", O_RDWR);
-    open("/dev/media_process", O_RDWR);
-    open("/dev/enc", O_RDWR);
-    open("/dev/jpeg", O_RDWR);
-    printf("[1] isp=%d vmm=%d\n", isp, vmm);
+    printf("[1] mp=%d isp=%d enc=%d jpg=%d vmm=%d\n", mp, isp, enc, jpg, vmm);
 
     /* SysInit */
     uint32_t sz = 0;
@@ -111,6 +114,14 @@ int main(void)
     uint32_t vo[2] = { 0, 1 };
     ret = ioctl(isp, VPSS_SET_VO_MODE, vo);
     printf("    VO_MODE:  0x%08x %s\n", (uint32_t)ret, ret == 0 ? "PASS" : "FAIL");
+
+    /* ISP init */
+    printf("[4b] ISP:\n");
+    uint32_t isp_p[4] = {0};
+    ret = ioctl(isp, ISP_INIT, isp_p);
+    printf("    INIT: ret=%d\n", ret);
+    ret = ioctl(isp, ISP_KICK, 0);
+    printf("    KICK: ret=%d\n", ret);
 
     /* Sensor */
     printf("[5] Sensor:\n");
