@@ -1,0 +1,43 @@
+# CV2003 Sensor VTable (124 bytes at 0x5E0840)
+# Copied to ISP at offset 0x162C by isp_core_sensor_install()
+# ISP calls these function pointers for sensor control
+
+  [ 0] 0x004c4df0  — name_ptr (-> 'cv2003_mipi')
+  [ 1] 0x0030daf0  — get_sensor_info (resolution, timing)
+  [ 2] 0x0030e7dc  — set_mirror_flip (reg 0x3028)
+  [ 3] 0x0030e86c  — get_mirror_flip (reg 0x3028)
+  [ 4] 0x0030eae8  — get_isp_default_config
+  [ 5] 0x0030d87c  — unknown5
+  [ 6] 0x0030d744  — unknown6 (called during init)
+  [ 7] 0x0030d8c8  — unknown7
+  [ 8] 0x0030de78  — set_format_and_init_regs (writes 52 regs, sets 0x3141=1)
+  [ 9] 0x0030e73c  — sensor_kick (start streaming callback)
+  [10] 0x0030e758  — unknown10
+  [11] 0x0030e644  — set_gain_value
+  [12] 0x0030e678  — set_gain_value2
+  [13] 0x0030e6e0  — unknown13
+  [14] 0x0030d9b8  — unknown14
+  [15] 0x0030e798  — unknown15
+  [16] 0x0030eac4  — get_exposure_max
+  [17] 0x0030eaa0  — get_exposure_min
+  [18] NULL          — NULL
+  [19] 0x0030e8e0  — unknown19
+  [20] 0x0030e204  — unknown20
+  [21] 0x0030e194  — unknown21
+  [22] 0x0030e498  — set_exposure (reg 0x304A/0x3049/0x3048)
+  [23] 0x0030e474  — get_exposure
+  [24] 0x0030e2d8  — set_analog_gain (reg 0x3154/0x314D/0x314C + gain table)
+  [25] 0x0030e2b4  — get_analog_gain
+  [26] 0x0030e5ac  — unknown26
+  [27] 0x0030e914  — unknown27
+  [28] 0x0030e934  — unknown28
+  [29] 0x0030e99c  — unknown29
+  [30] 0x0030d75c  — unknown30 (called during init)
+
+# Key registers used by vtable functions:
+#   0x3028 — mirror/flip control
+#   0x3048/3049/304A — exposure (24-bit)
+#   0x3154 — gain table index
+#   0x314C/314D — analog gain (10-bit)
+#   0x3804 — gain mode switch
+#   0x3141 — stream enable
