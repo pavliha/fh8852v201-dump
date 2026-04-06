@@ -27,8 +27,8 @@
 
 #include "fh_common.h"
 
-#define CV2003_I2C_ADDR     0x1A    /* 7-bit I2C address */
-#define CV2003_I2C_ADDR_RAW 0x35    /* Raw (with R/W bit space) */
+#define CV2003_I2C_ADDR     0x35    /* 7-bit I2C address (confirmed by bus scan) */
+#define CV2003_I2C_ADDR_RAW 0x6A    /* 8-bit address (0x35 << 1) */
 #define CV2003_ADDR_MODE    2       /* 16-bit register addr, 8-bit data */
 #define CV2003_SETTLE_US    10000   /* 10ms after register init */
 #define CV2003_SENSOR_CLK   24000000 /* 24 MHz input clock */
