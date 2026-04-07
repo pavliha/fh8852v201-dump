@@ -2,6 +2,23 @@
 
 Full flash dump from a KEVIEW H43 IP camera for OpenIPC development.
 
+## Repository Structure
+
+```
+firmware/
+  partitions/          # Flash partition images (uboot, kernel, appfs, config, data)
+  modules/             # Kernel modules (.ko) — ISP, encoder, JPEG, motor, NNA, etc.
+  binaries/            # ipcam binary, run.sh, load_driver.sh, ARC firmware
+sdk/
+  headers/             # Reconstructed FH8852V201 SDK headers (from Ghidra)
+  lib/                 # Clean-room libraries: fh_mpi, isp_init, cv2003 sensor driver
+  tools/               # Standalone utilities: I2C scanner, register dumpers, smoke test
+  tests/               # Reference tests (proc config discovery, GET_FRAME timeout fix)
+    archive/           # 40+ experimental tests from ISP bringup campaign (all failed)
+runtime/               # Live config captures: ipcam.conf, hw.conf, GPIO state, sensor regs
+majestic/              # OpenIPC Majestic streamer porting files
+```
+
 ## Hardware Specs
 
 | Spec | Detail |

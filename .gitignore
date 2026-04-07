@@ -3,3 +3,9 @@
 *.lock~
 *.rep/
 .idea/
+
+# Compiled ARM binaries
+sdk/tools/test_*
+sdk/tests/**/test_*
+!sdk/tests/**/*.c
+!sdk/tools/*.c
