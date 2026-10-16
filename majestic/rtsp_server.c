@@ -9,12 +9,15 @@
  * function tables for their existence, not their implementation).
  *
  * Scope: two video streams (stream1 = main, stream2 = sub), H.264 only,
- * UDP transport, up to RTSP_MAX_CLIENTS simultaneous viewers, optional
- * RTSP Basic auth, RTCP Sender Reports (send-only, once/sec per client —
- * see rtsp_server_send_rtcp_sr(), RFC 3550 6.4.1). No RTCP feedback
- * parsing (nothing reads the client's own RTCP packets), no
- * TCP-interleaved mode, no audio track. OPTIONS/DESCRIBE/SETUP/PLAY/
- * TEARDOWN/GET_PARAMETER only.
+ * up to RTSP_MAX_CLIENTS simultaneous viewers, optional RTSP Basic auth,
+ * RTCP Sender Reports (send-only, once/sec per client — see
+ * rtsp_server_send_rtcp_sr(), RFC 3550 6.4.1), and both UDP and
+ * TCP-interleaved transport (RFC 2326 S10.12 — a client requesting
+ * "RTP/AVP/TCP" in SETUP's Transport header gets its RTP/RTCP framed as
+ * '$'+channel+length directly on the RTSP TCP connection, no UDP sockets
+ * involved). No RTCP feedback parsing (nothing reads the client's own
+ * RTCP packets), no audio track. OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN/
+ * GET_PARAMETER only.
  */
 
 #include <stdio.h>
@@ -269,6 +272,32 @@ static void rtsp_handle_request(rtsp_server_t *srv, rtsp_client_t *c, const char
     } else if (strcmp(method, "SETUP") == 0) {
         char transport[256] = {0};
         header_value(req, "Transport", transport, sizeof(transport));
+
+        if (strstr(transport, "RTP/AVP/TCP") != NULL) {
+            /* RFC 2326 S10.12: media rides the same TCP connection as RTSP,
+               each packet prefixed with '$', a channel byte, and a 2-byte
+               big-endian length. No separate UDP sockets needed. */
+            int rtp_ch = 0, rtcp_ch = 1;
+            char *ip = strstr(transport, "interleaved=");
+            if (ip) sscanf(ip + strlen("interleaved="), "%d-%d", &rtp_ch, &rtcp_ch);
+
+            c->interleaved = 1;
+            c->rtp_channel = (uint8_t)rtp_ch;
+            c->rtcp_channel = (uint8_t)rtcp_ch;
+            c->session_id = srv->next_session_id++;
+            c->seq = 0;
+            c->ssrc = 0x4D494E49u + c->session_id;
+            c->playing = 0;
+            c->stream_id = parse_stream_id(req);
+
+            resp_len = snprintf(resp, sizeof(resp),
+                "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: %u\r\n"
+                "Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d\r\n\r\n",
+                cseq, c->session_id, rtp_ch, rtcp_ch);
+            send(c->tcp_fd, resp, (size_t)resp_len, 0);
+            return;
+        }
+
         int cport1 = 0, cport2 = 0;
         char *cp = strstr(transport, "client_port=");
         if (cp) sscanf(cp + strlen("client_port="), "%d-%d", &cport1, &cport2);
@@ -314,6 +343,7 @@ static void rtsp_handle_request(rtsp_server_t *srv, rtsp_client_t *c, const char
             c->ssrc = 0x4D494E49u + c->session_id; /* "MINI" + session id */
             c->playing = 0;
             c->stream_id = parse_stream_id(req);
+            c->interleaved = 0;
 
             resp_len = snprintf(resp, sizeof(resp),
                 "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: %u\r\n"
@@ -385,6 +415,22 @@ void rtsp_server_set_param_set(rtsp_server_t *srv, int stream_id, const uint8_t 
 
 #define RTP_MTU_PAYLOAD 1400
 
+/*
+ * RFC 2326 S10.12 interleaved framing: '$', channel byte, 2-byte
+ * big-endian length, then the raw RTP/RTCP packet — all on the same
+ * TCP connection the RTSP control traffic uses.
+ */
+static void send_interleaved(int tcp_fd, uint8_t channel, const uint8_t *data, size_t len)
+{
+    uint8_t hdr[4];
+    hdr[0] = '$';
+    hdr[1] = channel;
+    hdr[2] = (uint8_t)(len >> 8);
+    hdr[3] = (uint8_t)len;
+    send(tcp_fd, hdr, sizeof(hdr), 0);
+    send(tcp_fd, data, len, 0);
+}
+
 static void rtp_send_packet(rtsp_client_t *c, const uint8_t *payload, size_t len,
                              uint32_t ts, int marker)
 {
@@ -407,7 +453,12 @@ static void rtp_send_packet(rtsp_client_t *c, const uint8_t *payload, size_t len
     c->seq++;
     c->pkt_count++;
     c->octet_count += (uint32_t)len;
-    sendto(c->rtp_fd, pkt, 12 + len, 0, (struct sockaddr *)&c->rtp_addr, sizeof(c->rtp_addr));
+
+    if (c->interleaved) {
+        send_interleaved(c->tcp_fd, c->rtp_channel, pkt, 12 + len);
+    } else {
+        sendto(c->rtp_fd, pkt, 12 + len, 0, (struct sockaddr *)&c->rtp_addr, sizeof(c->rtp_addr));
+    }
 }
 
 /*
@@ -424,7 +475,8 @@ void rtsp_server_send_rtcp_sr(rtsp_server_t *srv, int stream_id, uint32_t rtp_ts
 
     for (int i = 0; i < RTSP_MAX_CLIENTS; i++) {
         rtsp_client_t *c = &srv->clients[i];
-        if (c->tcp_fd < 0 || !c->playing || c->rtcp_fd < 0 || c->stream_id != stream_id) continue;
+        if (c->tcp_fd < 0 || !c->playing || c->stream_id != stream_id) continue;
+        if (!c->interleaved && c->rtcp_fd < 0) continue;
 
         uint8_t pkt[28];
         pkt[0] = 0x80;
@@ -456,8 +508,12 @@ void rtsp_server_send_rtcp_sr(rtsp_server_t *srv, int stream_id, uint32_t rtp_ts
         pkt[26] = (uint8_t)(c->octet_count >> 8);
         pkt[27] = (uint8_t)c->octet_count;
 
-        sendto(c->rtcp_fd, pkt, sizeof(pkt), 0,
-               (struct sockaddr *)&c->rtcp_addr, sizeof(c->rtcp_addr));
+        if (c->interleaved) {
+            send_interleaved(c->tcp_fd, c->rtcp_channel, pkt, sizeof(pkt));
+        } else {
+            sendto(c->rtcp_fd, pkt, sizeof(pkt), 0,
+                   (struct sockaddr *)&c->rtcp_addr, sizeof(c->rtcp_addr));
+        }
     }
 }
 

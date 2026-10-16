@@ -21,6 +21,9 @@ typedef struct {
     int stream_id;
     uint32_t pkt_count;
     uint32_t octet_count;
+    int interleaved;        /* RTP/AVP/TCP (RFC 2326 S10.12) instead of UDP */
+    uint8_t rtp_channel;
+    uint8_t rtcp_channel;
     char rxbuf[2048];
     size_t rxlen;
 } rtsp_client_t;
