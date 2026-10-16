@@ -16,19 +16,24 @@ two unstripped kernel modules (`isp.ko`, `vmm.ko`) it drives via ioctl.
 clean-room libraries instead of a vendor SDK that doesn't exist in linkable form.
 
 **Status:** MIPI capture, VPSS pipeline, sensor I2C bring-up, and VMM allocation are confirmed
-working on real hardware. The ISP DMA buffer-address protocol — the piece that was blocking a
-first frame — is now fully reverse-engineered and reimplemented
-(`sdk/lib/isp_buf_addr.c`, derivation in `sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md`):
-every ioctl, every struct offset, every constant was read directly off the decompiled vendor
-code and kernel modules, not guessed.
+working on real hardware. Two more full subsystems are now fully reverse-engineered and
+reimplemented, every ioctl/struct-offset/constant read directly off the decompiled vendor binary
+and kernel modules, not guessed:
+
+- **ISP DMA buffer-address protocol** — the piece that was blocking a first frame
+  (`sdk/lib/isp_buf_addr.c`, derivation in `sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md`).
+- **VENC (encoder) ioctl layer** — create channel, rate control, start, get/release stream
+  (`majestic/mini_streamer.c`'s `venc_*` functions, derivation in
+  `sdk/headers/VENC_PROTOCOL_V201.md`). This replaces the project's earlier best-effort VENC
+  guesses — including discovering the real dispatch architecture (a per-channel vtable inside
+  `ipcam`, not direct ioctls) and that VENC's ioctls go on `/dev/enc`'s fd, not `/dev/isp`'s.
 
 `majestic/mini_streamer.c` now wires the whole pipeline together — device opens, MIPI, VPSS,
-sensor I2C, the new buffer-address protocol, and a best-effort VENC/encoder layer — and builds
-clean. One part is still a genuine open risk: the ISP register-table bring-up (~100+ raw
-`/dev/mem` writes) that was never resolved before this session either. The file's own header
-comments mark exactly which sections are hardware-proven, which are newly-derived-but-untested,
-and which are still blocked, so a crash can be attributed to the right layer. Next step is
-running it on real hardware.
+sensor I2C, buffer-address protocol, and the confirmed VENC layer — and builds clean. One part
+is still a genuine open risk: the ISP register-table bring-up (~100+ raw `/dev/mem` writes) that
+was never resolved before this session either. The file's own header comments mark exactly which
+sections are hardware-proven, which are newly-derived-but-untested, and which are still blocked,
+so a crash can be attributed to the right layer. Next step is running it on real hardware.
 
 ## Repository Structure
 
