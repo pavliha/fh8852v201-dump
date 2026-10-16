@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <sys/ioctl.h>
 
+#include "cv2003_driver.h"
+
 #define I2C_RDWR 0x0707
 #define I2C_M_RD 0x0001
 

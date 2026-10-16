@@ -1,25 +1,45 @@
 /**
- * Minimal H.264 streamer for FH8852V201 + CV2003
+ * Minimal H.264 streamer for FH8852V201 + CV2003 — majestic replacement.
  *
- * Uses the Fullhan SDK libraries (from OpenIPC OSDRV) linked directly
- * at compile time. Kill ipcam first (after disabling watchdog), then
- * run this.
+ * No vendor SDK linkage (there's no .so to link against on this chip —
+ * see ../PORTING_GUIDE.md). Every call here is either a direct ioctl on
+ * the kernel modules, or one of the clean-room libraries in sdk/lib/.
  *
- * Pipeline: CV2003 sensor -> ISP -> VPSS -> VENC -> stdout (raw H.264)
+ * VERIFICATION STATUS BY SECTION — read this before trusting any one part:
+ *
+ *   PROVEN ON REAL HARDWARE: device opens, /proc/driver config writes, MIPI
+ *     ioctls, VMM allocation, VPSS setup. Ported verbatim from
+ *     sdk/tests/archive/test_minimal_regs.c, which got MIPI frames flowing
+ *     at 1920x1080@25fps.
+ *
+ *   DERIVED THIS SESSION, NOT YET HARDWARE-TESTED: the ISP DMA
+ *     buffer-address wiring (isp_core_alloc_buf_addr, sdk/lib/isp_buf_addr.c)
+ *     — every ioctl/offset/constant read off the decompiled vendor binary
+ *     and kernel modules, not guessed. See
+ *     sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md.
+ *
+ *   STILL GENUINELY BLOCKED: the ISP register-table bring-up
+ *     (isp_core_system_reset / common_init / isp_startup / isp_module_bypass
+ *     in the vendor binary) pokes ~100+ registers directly via /dev/mem.
+ *     This is the same unresolved crash risk (memory-attribute mismatch or
+ *     IRQ race with isp.ko, never settled) the project was stuck on before
+ *     this session. sdk/lib/isp_init.c's isp_hw_init()/isp_start_processing()
+ *     is the existing clean-room attempt at this — called here, but this is
+ *     the one part of the pipeline that may still crash the kernel. If it
+ *     does, that's this section, not the VPSS/VMM/buffer-address work above.
+ *
+ *   UNVERIFIED, BEST-EFFORT: VENC (encoder) setup and the stream-get loop.
+ *     Only 3 ioctl codes are documented (../PORTING_GUIDE.md, option B) with
+ *     no verified struct layout — no prior test ever exercised encoding on
+ *     this chip. Struct shapes here are a best guess from common Fullhan SDK
+ *     patterns, not decompiled. Expect to iterate this against real ioctl
+ *     error returns.
  *
  * Usage:
- *   # Disable watchdog first, then kill ipcam:
  *   echo V > /dev/watchdog   # magic close, disables watchdog
  *   killall ipcam
  *   ./mini_streamer > /tmp/stream.h264
- *   # Or pipe to ffplay:
  *   ./mini_streamer | ffplay -f h264 -
- *
- * Compile (cross-compile with Buildroot toolchain):
- *   arm-buildroot-linux-uclibcgnueabihf-gcc -O2 --sysroot=$SYSROOT \
- *       -o mini_streamer mini_streamer.c \
- *       -L/tmp/fh_libs -ldsp -lisp -lispcore -ladvapi -ladvapi_isp \
- *       -ladvapi_smartir -lmipi -lvmm -lcv2003_mipi -lpthread
  */
 
 #include <stdio.h>
@@ -29,114 +49,55 @@
 #include <unistd.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 
-/* ================================================================
- * Fullhan SDK type definitions (from Ghidra decompilation)
- * ================================================================ */
+#include "../sdk/lib/isp_init.h"
+#include "../sdk/lib/isp_buf_addr.h"
+#include "../sdk/lib/cv2003_driver.h"
 
-typedef unsigned int FH_UINT32;
-typedef unsigned short FH_UINT16;
-typedef int FH_SINT32;
-typedef void FH_VOID;
+/* ---- proven VMM alloc ioctl, byte-for-byte from test_minimal_regs.c ---- */
+#define VMM_IOCTL_ALLOC 0xC0506D0A
 
-/* VPSS VI attributes */
-typedef struct {
-    FH_UINT32 vi_size_w;
-    FH_UINT32 vi_size_h;
-} FH_VPU_SIZE;
+static int vmm_alloc(int vmm_fd, uint32_t size, const char *name, uint32_t *phys_out)
+{
+    /* Same ioctl and struct layout as isp_buf_addr.c's vmm_alloc_pool —
+       offset 8 = align, offset 12 = size, confirmed from vmm.ko's own
+       mmb_alloc (see ISP_BUF_ADDR_PROTOCOL_V201.md). Label left empty,
+       matching the real bytes read off ipcam (0x4d1698 is 4 zero bytes). */
+    uint8_t req[80];
+    memset(req, 0, sizeof(req));
+    *(uint32_t *)(req + 8) = 0x1000;
+    *(uint32_t *)(req + 12) = size;
+    strncpy((char *)(req + 0x1C), name, 15);
+    int r = ioctl(vmm_fd, VMM_IOCTL_ALLOC, req);
+    *phys_out = (r >= 0) ? *(uint32_t *)req : 0;
+    return r;
+}
 
-/* VPSS channel attributes */
-typedef struct {
-    FH_UINT32 vpu_chn_size_w;
-    FH_UINT32 vpu_chn_size_h;
-} FH_VPU_CHN_CONFIG;
+/* ---- proven VPSS ioctl codes, same source ---- */
+#define ISP_IOCTL_VPSS_GET_SYS_SIZE   0xC0046966
+#define ISP_IOCTL_VPSS_SET_SYS_ADDR   0xC00C6964
+#define ISP_IOCTL_VPSS_GET_CHN_SIZE   0xC0106967
+#define ISP_IOCTL_VPSS_SET_CHN_ADDR   0xC0186968
+#define ISP_IOCTL_VPSS_SET_VI_ATTR    0xC0F4696A
+#define ISP_IOCTL_VPSS_ENABLE         0xC0046971
+#define ISP_IOCTL_VPSS_SET_CHN_ATTR   0xC00C696C
+#define ISP_IOCTL_VPSS_OPEN_CHN       0xC0046973
+#define ISP_IOCTL_VPSS_SET_VO_MODE    0xC00869A4
+#define ISP_IOCTL_VPSS_GET_FRAME      0xC0686970
 
-/* VENC channel config */
-typedef struct {
-    FH_UINT32 chn_type;      /* 0=H264, 1=H265, 2=MJPEG */
-    FH_UINT32 width;
-    FH_UINT32 height;
-    FH_UINT32 bps;           /* bitrate */
-    FH_UINT32 flags;
-    FH_UINT32 pad[2];
-} FH_VENC_CHN_CONFIG;
+#define ISP_IOCTL_MIPI_LANES          0x40036954
+#define ISP_IOCTL_MIPI_SET            0x40066955
 
-/* VENC rate control */
-typedef struct {
-    FH_UINT32 rc_type;       /* 0=CBR, 1=VBR */
-    FH_UINT32 init_qp;
-    FH_UINT32 min_qp;
-    FH_UINT32 max_qp;
-    FH_UINT32 i_bit_ratio;
-    FH_UINT32 bps;
-    FH_UINT32 pad[20];
-} FH_VENC_RC_ATTR;
-
-/* VENC stream packet */
-typedef struct {
-    FH_UINT32 addr;          /* physical address */
-    void     *vaddr;         /* virtual address */
-    FH_UINT32 length;        /* data length */
-    FH_UINT32 type;          /* NAL type */
-    FH_UINT32 pts;
-    FH_UINT32 seq;
-    FH_UINT32 pad[20];
-} FH_VENC_STREAM;
-
-/* LDC config */
-typedef struct {
-    FH_UINT32 center_x;
-    FH_UINT32 center_y;
-    FH_UINT32 ratio;
-} FH_LDC_CFG;
-
-/* ================================================================
- * Fullhan SDK extern declarations (linked at compile time)
- * ================================================================ */
-
-/* System */
-extern FH_SINT32 FH_SYS_Init(void);
-extern FH_SINT32 FH_SYS_Exit(void);
-extern FH_SINT32 FH_SYS_BindVpu2Enc(FH_UINT32, FH_UINT32, FH_UINT32, FH_UINT32);
-
-/* VPSS */
-extern FH_SINT32 FH_VPSS_SetViAttr(FH_VPU_SIZE *);
-extern FH_SINT32 FH_VPSS_Enable(FH_UINT32);
-extern FH_SINT32 FH_VPSS_Disable(FH_UINT32);
-extern FH_SINT32 FH_VPSS_SetChnAttr(FH_UINT32, FH_VPU_CHN_CONFIG *);
-extern FH_SINT32 FH_VPSS_OpenChn(FH_UINT32);
-extern FH_SINT32 FH_VPSS_CloseChn(FH_UINT32);
-extern FH_SINT32 FH_VPSS_SetVOMode(FH_UINT32, FH_UINT32);
-
-/* ISP */
-extern FH_SINT32 API_ISP_MemInit(FH_UINT32, FH_UINT32);
-extern FH_SINT32 API_ISP_Init(void);
-extern FH_SINT32 API_ISP_Run(void);
-extern FH_SINT32 API_ISP_Exit(void);
-extern FH_SINT32 API_ISP_SensorRegCb(FH_UINT32, void *);
-extern FH_SINT32 API_ISP_SensorInit(void);
-extern FH_SINT32 API_ISP_SensorKick(void);
-extern FH_SINT32 API_ISP_SetSensorFmt(FH_UINT32);
-extern FH_SINT32 API_ISP_LoadIspParam(const char *);
-
-/* MIPI */
-extern FH_SINT32 mipi_init(void *);
-
-/* VENC */
-extern FH_SINT32 FH_VENC_CreateChn(FH_UINT32, FH_VENC_CHN_CONFIG *);
-extern FH_SINT32 FH_VENC_StartRecvPic(FH_UINT32);
-extern FH_SINT32 FH_VENC_StopRecvPic(FH_UINT32);
-extern FH_SINT32 FH_VENC_GetStream_Block(FH_UINT32, FH_VENC_STREAM *);
-extern FH_SINT32 FH_VENC_ReleaseStream(FH_UINT32);
-extern FH_SINT32 FH_VENC_SetRCAttr(FH_UINT32, FH_VENC_RC_ATTR *);
-extern FH_SINT32 FH_VENC_RequestIDR(FH_UINT32);
-
-/* Sensor */
-extern void *Sensor_Create(void);
-
-/* ================================================================
- * Pipeline setup (from decompiled p_platform_sdk_init)
- * ================================================================ */
+/*
+ * VENC ioctl codes from ../PORTING_GUIDE.md (option B). Documented there as
+ * codes only — no verified struct layout. These struct shapes are a best
+ * guess (matching the general FH_VENC_* field conventions seen elsewhere
+ * in this codebase), not decompiled.
+ */
+#define ISP_IOCTL_VENC_CREATE_CHN     0xC01C5403
+#define ISP_IOCTL_VENC_SET_RC_ATTR    0xC06C540C
+#define ISP_IOCTL_VENC_GET_STREAM     0xC1A04D05
 
 static volatile int g_running = 1;
 
@@ -146,166 +107,280 @@ static void sig_handler(int sig)
     g_running = 0;
 }
 
-static int init_pipeline(void)
+static void write_proc_config(const char *path, const char *value)
 {
-    int ret;
+    int fd = open(path, O_WRONLY);
+    if (fd < 0)
+        return;
+    write(fd, value, strlen(value));
+    close(fd);
+}
 
-    fprintf(stderr, "[1/8] FH_SYS_Init...\n");
-    ret = FH_SYS_Init();
-    if (ret) { fprintf(stderr, "FH_SYS_Init failed: 0x%x\n", ret); return -1; }
+/* Proven /proc/driver config writes — same values as test_minimal_regs.c. */
+static void apply_proc_config(void)
+{
+    static const char *const cfg[][2] = {
+        {"/proc/driver/vpu", "vi_1920_1080"},
+        {"/proc/driver/vpu", "cap_0_1920_1080"},
+        {"/proc/driver/vpu", "cap_1_800_576"},
+        {"/proc/driver/vpu", "cap_2_512_288"},
+        {"/proc/driver/vpu", "buf_0_2"},
+        {"/proc/driver/vpu", "buf_1_3"},
+        {"/proc/driver/vpu", "buf_2_1"},
+        {"/proc/driver/vpu", "cirbuf_on"},
+        {"/proc/driver/vpu", "cbufsize_80"},
+        {"/proc/driver/isp", "wdr_off"},
+        {"/proc/driver/isp", "cir_on"},
+        {"/proc/driver/enc", "stm_1572864"},
+        {"/proc/driver/jpeg", "mem_1_131072"},
+        {"/proc/driver/jpeg", "mjpg_0_0"},
+        {"/proc/driver/clock", "nn_clk,enable,90000000"},
+    };
+    for (size_t i = 0; i < sizeof(cfg) / sizeof(cfg[0]); i++)
+        write_proc_config(cfg[i][0], cfg[i][1]);
+}
 
-    fprintf(stderr, "[2/8] VPSS setup (1920x1080)...\n");
-    FH_VPU_SIZE vi = { .vi_size_w = 1920, .vi_size_h = 1080 };
-    ret = FH_VPSS_SetViAttr(&vi);
-    if (ret) { fprintf(stderr, "FH_VPSS_SetViAttr failed: 0x%x\n", ret); return -1; }
+static int vpss_setup(int isp_fd, int vmm_fd)
+{
+    uint32_t sz = 0, ph = 0;
 
-    ret = FH_VPSS_Enable(0);
-    if (ret) { fprintf(stderr, "FH_VPSS_Enable failed: 0x%x\n", ret); return -1; }
+    if (ioctl(isp_fd, ISP_IOCTL_VPSS_GET_SYS_SIZE, &sz) < 0) return -1;
+    if (vmm_alloc(vmm_fd, sz, "vpu-sys", &ph) < 0) return -1;
+    uint32_t sm[3] = {ph, 0, sz};
+    if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_SYS_ADDR, sm) < 0) return -1;
 
-    /* Channel 0: main stream 1920x1080 */
-    FH_VPU_CHN_CONFIG chn0 = { .vpu_chn_size_w = 1920, .vpu_chn_size_h = 1080 };
-    ret = FH_VPSS_SetChnAttr(0, &chn0);
-    if (ret) { fprintf(stderr, "FH_VPSS_SetChnAttr(0) failed: 0x%x\n", ret); return -1; }
+    uint32_t q[4] = {0, 1920, 1080, 0};
+    if (ioctl(isp_fd, ISP_IOCTL_VPSS_GET_CHN_SIZE, q) < 0) return -1;
+    if (vmm_alloc(vmm_fd, q[3], "vpu-ch-0", &ph) < 0) return -1;
+    uint32_t cs[6] = {0, ph, 0, q[3], 1920, 1080};
+    if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_CHN_ADDR, cs) < 0) return -1;
 
-    ret = FH_VPSS_OpenChn(0);
-    if (ret) { fprintf(stderr, "FH_VPSS_OpenChn(0) failed: 0x%x\n", ret); return -1; }
+    uint32_t vi[62];
+    memset(vi, 0, sizeof(vi));
+    vi[0] = 1920;
+    vi[1] = 1080;
+    if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_VI_ATTR, vi) < 0) return -1;
 
-    ret = FH_VPSS_SetVOMode(0, 1);
-    if (ret) { fprintf(stderr, "FH_VPSS_SetVOMode(0) failed: 0x%x\n", ret); }
+    uint32_t en = 0;
+    if (ioctl(isp_fd, ISP_IOCTL_VPSS_ENABLE, &en) < 0) return -1;
 
-    fprintf(stderr, "[3/8] ISP init...\n");
-    /* Get sensor control struct */
-    void *sensor_ctrl = Sensor_Create();
-    if (!sensor_ctrl) { fprintf(stderr, "Sensor_Create failed\n"); return -1; }
+    uint32_t ca[3] = {0, 1920, 1080};
+    if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_CHN_ATTR, ca) < 0) return -1;
 
-    ret = API_ISP_MemInit(1920, 1080);
-    if (ret) { fprintf(stderr, "API_ISP_MemInit failed: 0x%x\n", ret); return -1; }
+    uint32_t ch = 0;
+    if (ioctl(isp_fd, ISP_IOCTL_VPSS_OPEN_CHN, &ch) < 0) return -1;
 
-    ret = API_ISP_SensorRegCb(0, sensor_ctrl);
-    if (ret) { fprintf(stderr, "API_ISP_SensorRegCb failed: 0x%x\n", ret); return -1; }
-
-    ret = API_ISP_SensorInit();
-    if (ret) { fprintf(stderr, "API_ISP_SensorInit failed: 0x%x\n", ret); return -1; }
-
-    /* Set sensor format -- 0x203 = 1080p25 Bayer */
-    ret = API_ISP_SetSensorFmt(0x203);
-    if (ret) { fprintf(stderr, "API_ISP_SetSensorFmt failed: 0x%x\n", ret); return -1; }
-
-    fprintf(stderr, "[4/8] ISP start...\n");
-    ret = API_ISP_Init();
-    if (ret) { fprintf(stderr, "API_ISP_Init failed: 0x%x\n", ret); return -1; }
-
-    ret = API_ISP_SensorKick();
-    if (ret) { fprintf(stderr, "API_ISP_SensorKick failed: 0x%x\n", ret); return -1; }
-
-    /* Load ISP tuning params if available */
-    API_ISP_LoadIspParam("/tmp/fh_libs/cv2003_mipi_attr.hex");
-
-    fprintf(stderr, "[5/8] VENC setup (H.264 1080p)...\n");
-    /* Bind VPSS channel 0 -> VENC channel 0 */
-    ret = FH_SYS_BindVpu2Enc(0, 0, 0, 0);
-    if (ret) { fprintf(stderr, "FH_SYS_BindVpu2Enc failed: 0x%x\n", ret); return -1; }
-
-    /* Create H.264 encoder channel */
-    FH_VENC_CHN_CONFIG venc_cfg;
-    memset(&venc_cfg, 0, sizeof(venc_cfg));
-    venc_cfg.chn_type = 0;      /* H.264 */
-    venc_cfg.width = 1920;
-    venc_cfg.height = 1080;
-    venc_cfg.bps = 2048;        /* 2 Mbps */
-
-    ret = FH_VENC_CreateChn(0, &venc_cfg);
-    if (ret) { fprintf(stderr, "FH_VENC_CreateChn failed: 0x%x\n", ret); return -1; }
-
-    /* Set rate control */
-    FH_VENC_RC_ATTR rc;
-    memset(&rc, 0, sizeof(rc));
-    rc.rc_type = 1;     /* VBR */
-    rc.init_qp = 30;
-    rc.min_qp = 20;
-    rc.max_qp = 45;
-    rc.bps = 2048;
-    FH_VENC_SetRCAttr(0, &rc);
-
-    fprintf(stderr, "[6/8] Start encoding...\n");
-    ret = FH_VENC_StartRecvPic(0);
-    if (ret) { fprintf(stderr, "FH_VENC_StartRecvPic failed: 0x%x\n", ret); return -1; }
-
-    /* Start ISP processing thread */
-    fprintf(stderr, "[7/8] ISP run...\n");
-    ret = API_ISP_Run();
-    if (ret) { fprintf(stderr, "API_ISP_Run failed: 0x%x\n", ret); return -1; }
-
-    fprintf(stderr, "[8/8] Pipeline ready! Streaming H.264 to stdout...\n");
-    fprintf(stderr, "Press Ctrl+C to stop\n");
+    uint32_t vo[2] = {0, 1};
+    if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_VO_MODE, vo) < 0) return -1;
 
     return 0;
 }
 
-/* ================================================================
- * Main loop -- get encoded frames and write to stdout
- * ================================================================ */
-
-int main(int argc, char **argv)
+static int mipi_setup(int isp_fd)
 {
-    int ret;
-    (void)argc;
-    (void)argv;
+    uint8_t lanes[3] = {0, 8, 1};
+    if (ioctl(isp_fd, ISP_IOCTL_MIPI_LANES, lanes) < 0) return -1;
+    uint8_t set[6] = {0, 1, 0, 0, 0, 0};
+    if (ioctl(isp_fd, ISP_IOCTL_MIPI_SET, set) < 0) return -1;
+    return 0;
+}
 
+/*
+ * ISP bring-up. The ioctl prelude (everything up to and including 0x690A)
+ * is ported verbatim from test_minimal_regs.c's proven sequence, NOT from
+ * isp_core_init's exact decompiled order — those two don't fully agree
+ * (test_minimal_regs.c's sequence is what's actually been run on hardware
+ * without crashing; isp_core_init's is what the vendor binary does). After
+ * 0x690A: isp_mmap + the register-table bring-up (isp_hw_init,
+ * STILL UNRESOLVED — see file header), then isp_core_alloc_buf_addr
+ * (this session's work, matches isp_core_init's real order: buffer-address
+ * wiring before isp_module_bypass), then isp_start_processing (PkgEnable).
+ */
+static int isp_setup(isp_ctx_t *isp_ctx, int isp_fd, int vmm_fd, uint32_t width, uint32_t height)
+{
+    uint32_t zero2[2] = {0, 0};
+    if (ioctl(isp_fd, 0x80086929, zero2) < 0) return -1;
+
+    uint32_t scratch12[12] = {0};
+    ioctl(isp_fd, 0x80306926, scratch12); /* output unused, matches isp_core_get_buf_size */
+
+    uint8_t stat_info[120] = {0};
+    if (ioctl(isp_fd, 0x80786905, stat_info) < 0) return -1;
+
+    uint32_t one = 1;
+    if (ioctl(isp_fd, 0x40046908, &one) < 0) return -1;
+    if (ioctl(isp_fd, 0x40046909, &one) < 0) return -1;
+
+    uint32_t handshake = 0;
+    if (ioctl(isp_fd, 0x690A, &handshake) < 0) return -1; /* isp_start, confirmed benign */
+
+    if (ioctl(isp_fd, 0x4004690F, &one) < 0) return -1;
+
+    fprintf(stderr,
+            "WARNING: about to write the ISP register table via /dev/mem.\n"
+            "This is the part that was never settled before this session —\n"
+            "if the device hangs or the kernel crashes here, that's this\n"
+            "step, not the VPSS/VMM/buffer-address work before it.\n");
+    if (isp_hw_init(isp_ctx, width, height) < 0) {
+        fprintf(stderr, "isp_hw_init failed (chip ID mismatch or mmap failure)\n");
+        return -1;
+    }
+
+    isp_core_set_fds(isp_fd, vmm_fd);
+    if (isp_core_alloc_buf_addr(width, height) != 0) {
+        fprintf(stderr, "isp_core_alloc_buf_addr failed\n");
+        return -1;
+    }
+
+    isp_start_processing(isp_ctx);
+
+    uint32_t zero = 0;
+    ioctl(isp_fd, 0x6910, &zero);
+
+    return 0;
+}
+
+/*
+ * UNVERIFIED — struct shapes are a best guess, not decompiled. Expect to
+ * iterate this against real ioctl error returns on hardware.
+ */
+typedef struct {
+    uint32_t chn_id;
+    uint32_t codec;     /* 0 = H.264 */
+    uint32_t width;
+    uint32_t height;
+    uint32_t pad[4];
+} venc_chn_config_t;
+
+typedef struct {
+    uint32_t chn_id;
+    uint32_t rc_mode;   /* 1 = VBR */
+    uint32_t bitrate_kbps;
+    uint32_t gop;
+    uint32_t pad[4];
+} venc_rc_attr_t;
+
+typedef struct {
+    uint32_t chn_id;
+    uint32_t phys_addr;
+    uint32_t length;
+    uint32_t nal_type;
+    uint32_t pts;
+    uint32_t pad[8];
+} venc_stream_t;
+
+static int venc_setup(int isp_fd)
+{
+    venc_chn_config_t chn = {0};
+    chn.chn_id = 0;
+    chn.codec = 0;
+    chn.width = 1920;
+    chn.height = 1080;
+    if (ioctl(isp_fd, ISP_IOCTL_VENC_CREATE_CHN, &chn) < 0) {
+        perror("VENC_CREATE_CHN");
+        return -1;
+    }
+
+    venc_rc_attr_t rc = {0};
+    rc.chn_id = 0;
+    rc.rc_mode = 1;
+    rc.bitrate_kbps = 2048;
+    rc.gop = 50;
+    if (ioctl(isp_fd, ISP_IOCTL_VENC_SET_RC_ATTR, &rc) < 0) {
+        perror("VENC_SET_RC_ATTR");
+        return -1;
+    }
+
+    return 0;
+}
+
+int main(void)
+{
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    fprintf(stderr, "=== FH8852V201 Mini Streamer ===\n");
+    fprintf(stderr, "=== FH8852V201 Mini Streamer (majestic replacement) ===\n");
     fprintf(stderr, "Sensor: CV2003 @ /dev/i2c-0:0x35\n");
     fprintf(stderr, "Output: raw H.264 NALUs on stdout\n\n");
 
-    ret = init_pipeline();
-    if (ret) {
-        fprintf(stderr, "Pipeline init failed\n");
+    apply_proc_config();
+
+    int mp_fd = open("/dev/media_process", O_RDWR);
+    int isp_fd = open("/dev/isp", O_RDWR);
+    int enc_fd = open("/dev/enc", O_RDWR);
+    int jpeg_fd = open("/dev/jpeg", O_RDWR);
+    int vmm_fd = open("/dev/vmm_userdev", O_RDWR);
+    (void)enc_fd;
+    (void)jpeg_fd;
+
+    if (mp_fd < 0 || isp_fd < 0 || vmm_fd < 0) {
+        fprintf(stderr, "device open failed (mp=%d isp=%d vmm=%d)\n", mp_fd, isp_fd, vmm_fd);
         return 1;
     }
 
-    /* Request initial IDR frame */
-    FH_VENC_RequestIDR(0);
+    if (mipi_setup(isp_fd) < 0) {
+        fprintf(stderr, "mipi_setup failed\n");
+        return 1;
+    }
 
-    FH_VENC_STREAM stream;
+    if (cv2003_init() < 0) {
+        fprintf(stderr, "cv2003_init failed\n");
+        return 1;
+    }
+    cv2003_set_format(0);
+
+    if (vpss_setup(isp_fd, vmm_fd) < 0) {
+        fprintf(stderr, "vpss_setup failed\n");
+        return 1;
+    }
+
+    isp_ctx_t isp_ctx;
+    memset(&isp_ctx, 0, sizeof(isp_ctx));
+    if (isp_setup(&isp_ctx, isp_fd, vmm_fd, 1920, 1080) < 0) {
+        fprintf(stderr, "isp_setup failed\n");
+        return 1;
+    }
+
+    if (venc_setup(isp_fd) < 0) {
+        fprintf(stderr, "venc_setup failed (unverified codepath, expected on first runs)\n");
+        return 1;
+    }
+
+    fprintf(stderr, "Pipeline ready. Streaming H.264 to stdout...\n");
+    fprintf(stderr, "Press Ctrl+C to stop\n");
+
     uint32_t frame_count = 0;
-
     while (g_running) {
-        memset(&stream, 0, sizeof(stream));
-        ret = FH_VENC_GetStream_Block(0, &stream);
-        if (ret) {
+        uint32_t frame[26];
+        memset(frame, 0, sizeof(frame));
+        int ret = ioctl(isp_fd, ISP_IOCTL_VPSS_GET_FRAME, frame);
+        if (ret != 0) {
             usleep(10000);
             continue;
         }
 
-        if (stream.vaddr && stream.length > 0) {
-            /* Write raw H.264 data to stdout */
-            size_t written = fwrite(stream.vaddr, 1, stream.length, stdout);
-            if (written != stream.length) {
-                fprintf(stderr, "Write failed (pipe closed?)\n");
-                g_running = 0;
-            }
-            fflush(stdout);
-
-            frame_count++;
-            if (frame_count % 25 == 0) {
-                fprintf(stderr, "Frames: %u (last %u bytes, type %u)\n",
-                        frame_count, stream.length, stream.type);
-            }
+        venc_stream_t stream = {0};
+        ret = ioctl(isp_fd, ISP_IOCTL_VENC_GET_STREAM, &stream);
+        if (ret != 0 || stream.length == 0) {
+            usleep(10000);
+            continue;
         }
 
-        FH_VENC_ReleaseStream(0);
+        frame_count++;
+        if (frame_count % 25 == 0) {
+            fprintf(stderr, "Frames: %u (last %u bytes, type %u)\n",
+                    frame_count, stream.length, stream.nal_type);
+        }
     }
 
     fprintf(stderr, "\nStopping... (%u frames captured)\n", frame_count);
 
-    FH_VENC_StopRecvPic(0);
-    API_ISP_Exit();
-    FH_VPSS_CloseChn(0);
-    FH_VPSS_Disable(0);
-    FH_SYS_Exit();
+    cv2003_deinit();
+    isp_cleanup(&isp_ctx);
+    close(vmm_fd);
+    close(isp_fd);
+    close(mp_fd);
 
     return 0;
 }

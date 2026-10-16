@@ -39,6 +39,8 @@
 #include <sys/ioctl.h>
 #include <stdint.h>
 
+#include "isp_buf_addr.h"
+
 #define ISP_IOCTL_HANDSHAKE     0x40016921  /* confirmed no-op in isp.ko */
 #define ISP_IOCTL_GET_BUF_INFO  0x80306926  /* output unused by this path */
 #define ISP_IOCTL_SET_DMA_ADDRS 0x40016920  /* isp.ko copies this straight into hw DMA regs */
@@ -111,6 +113,12 @@ typedef struct {
 } isp_core_t;
 
 static isp_core_t isp_core;
+
+void isp_core_set_fds(int isp_fd, int vmm_fd)
+{
+    isp_core.isp_fd = isp_fd;
+    isp_core.vmm_fd = vmm_fd;
+}
 
 static uint32_t round_up8(uint32_t v)
 {

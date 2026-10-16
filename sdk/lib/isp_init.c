@@ -7,8 +7,15 @@
  * sensor resolution, standard signal processing theory, and
  * documented register semantics.
  *
- * CRITICAL: All registers must be written BEFORE calling
- * isp_start (ioctl 0x690A) which enables the ISP interrupt.
+ * CORRECTION (2026-10-17): the comment below originally said call this
+ * BEFORE ioctl 0x690A. Decompiling the real isp_core_init this session
+ * showed the opposite — it issues ioctl 0x690A as its very first
+ * operation, before its own isp_mmap or any register write. isp_hw_init()
+ * should be called AFTER ioctl 0x690A, not before. Not yet re-verified on
+ * hardware; this is a correction to the ordering assumption, not proof the
+ * registers themselves are now safe to write (see
+ * sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md and mini_streamer.c's header
+ * for the still-unresolved crash risk this function carries).
  */
 
 #include <stdio.h>
@@ -19,18 +26,10 @@
 #include <sys/ioctl.h>
 #include <stdint.h>
 
+#include "isp_init.h"
+
 #define ISP_REG_BASE  0xE8400000
 #define ISP_REG_SIZE  0x4000   /* 16KB mapped for safety */
-
-/**
- * ISP register context — holds mmap pointer.
- */
-typedef struct {
-    volatile uint32_t *regs;
-    int mem_fd;
-    uint32_t width;
-    uint32_t height;
-} isp_ctx_t;
 
 /**
  * Map ISP hardware registers via /dev/mem.

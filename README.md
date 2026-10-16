@@ -20,8 +20,15 @@ working on real hardware. The ISP DMA buffer-address protocol — the piece that
 first frame — is now fully reverse-engineered and reimplemented
 (`sdk/lib/isp_buf_addr.c`, derivation in `sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md`):
 every ioctl, every struct offset, every constant was read directly off the decompiled vendor
-code and kernel modules, not guessed. Untested on hardware yet — wiring it into
-`mini_streamer.c` is the next step.
+code and kernel modules, not guessed.
+
+`majestic/mini_streamer.c` now wires the whole pipeline together — device opens, MIPI, VPSS,
+sensor I2C, the new buffer-address protocol, and a best-effort VENC/encoder layer — and builds
+clean. One part is still a genuine open risk: the ISP register-table bring-up (~100+ raw
+`/dev/mem` writes) that was never resolved before this session either. The file's own header
+comments mark exactly which sections are hardware-proven, which are newly-derived-but-untested,
+and which are still blocked, so a crash can be attributed to the right layer. Next step is
+running it on real hardware.
 
 ## Repository Structure
 
