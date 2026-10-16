@@ -112,6 +112,30 @@ writes, H.264 branch — stream type 4):
 If `[2]` is 0, no stream is available and `ReleaseStream` is called internally with no data
 returned — callers should treat a zero pack count the same way.
 
+**Kernel-side readiness mechanism (2026-10-17 addendum, confirmed via `media_process.ko` /
+`enc.ko`, both unstripped):** `ipcam`'s `hhe_h264_query_stream`/`hhe_h265_query_stream` wrappers
+(in `enc.ko`) call `media_stream_query(4, ...)` (in `media_process.ko`), which forwards to
+`enc_stream_query`:
+
+```c
+undefined4 enc_stream_query(int *param_1, void *param_2)
+{
+    if (*param_1 != param_1[1]) {
+        memcpy(param_2, param_1 + *param_1 * 0x66 + 4, 0x198);
+        return 1;
+    }
+    return 0;
+}
+```
+
+This is a plain ring buffer: `param_1[0]`/`param_1[1]` are read/write indices, and each queued
+entry is a fixed 408-byte (`0x198`) record. This confirms the "stream ready" signal `[2]` above
+is backed by a real queue, not a flaky polling flag. It does **not** resolve whether the DMA
+bitstream bytes at each pack's `phys_addr` carry an Annex-B start code — this ring buffer is a
+separate metadata queue, not the bitstream payload itself, and no further static reference
+exists in this firmware build to check that against (see `mini_streamer.c`'s file header: this
+stays a flagged inference, defensively handled, not a confirmed fact).
+
 ## `ReleaseStream` — `0xC004540A`
 
 `ioctl(enc_fd, 0xc004540a, &handle)` where `handle` is the word read back at `GetStream`'s
