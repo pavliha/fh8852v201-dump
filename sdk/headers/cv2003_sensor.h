@@ -5,12 +5,12 @@
  * Sensor: CV2003 / GC4201AC (Galaxycore rebranded)
  * Interface: MIPI CSI, 1 lane, 800-999 Mbps
  * Resolution: 1920x1080
- * I2C: slave 0x1A (7-bit), /dev/i2c-0, 16-bit addr, 8-bit data
+ * I2C: slave 0x35 (7-bit), /dev/i2c-0, 16-bit addr, 8-bit data
  * Sensor clock: 24 MHz (cis_clk_out)
  * Driver version: "mipi version: V1.1.1 17.0.0(build 000)(gc4201ac)"
  *
  * Init sequence (from decompiled FUN_0030de78):
- *   1. SensorDevice_Init(0x1A, mode=2)  // open I2C, set 16-bit addr
+ *   1. SensorDevice_Init(0x35, mode=2)  // open I2C, set 16-bit addr
  *   2. Write register table (52 entries for selected fps)
  *   3. usleep(10000)  // 10ms settle time
  *   4. Sensor_Write(0x3141, 0x01)  // enable streaming
@@ -20,6 +20,11 @@
  *   ioctl(fd, 0x704, 0)     — set address mode
  *   ioctl(fd, 0x706, addr)  — set slave address
  *   ioctl(fd, 0x707, &msg)  — read/write transfer
+ *
+ * Detect function (FUN_0030d75c):
+ *   Tries 2 candidate I2C addresses (8-bit write addrs, right-shifted for 7-bit).
+ *   Reads register 0x307a (expects 0x02 or 0x20) and 0x3138 (expects 0x03)
+ *   for chip ID verification.
  */
 
 #ifndef __CV2003_SENSOR_H__
@@ -27,12 +32,20 @@
 
 #include "fh_common.h"
 
-#define CV2003_I2C_ADDR     0x35    /* 7-bit I2C address (confirmed by bus scan) */
+#define CV2003_I2C_ADDR     0x35    /* 7-bit I2C address (verified live 2026-04-07: PID1=0x02, PID2=0x03) */
 #define CV2003_I2C_ADDR_RAW 0x6A    /* 8-bit address (0x35 << 1) */
 #define CV2003_ADDR_MODE    2       /* 16-bit register addr, 8-bit data */
 #define CV2003_SETTLE_US    10000   /* 10ms after register init */
 #define CV2003_SENSOR_CLK   24000000 /* 24 MHz input clock */
 #define CV2003_MIPI_LANES   1       /* Single MIPI lane */
+
+/* Chip ID registers and expected values (verified live) */
+#define CV2003_REG_PID1         0x307a  /* Chip ID register 1 */
+#define CV2003_REG_PID2         0x3138  /* Chip ID register 2 */
+#define CV2003_PID1_VAL_A       0x02    /* Expected PID1 value (variant A) */
+#define CV2003_PID1_VAL_B       0x20    /* Expected PID1 value (variant B) */
+#define CV2003_PID2_VAL         0x03    /* Expected PID2 value */
+#define CV2003_VCYCLE_DEFAULT   2700    /* Default v_cycle (verified: 0x0A8C) */
 
 /* Key registers */
 #define CV2003_REG_STREAM_EN    0x3141  /* Write 1 to start streaming */

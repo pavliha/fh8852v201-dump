@@ -1,6 +1,27 @@
 # KEVIEW H43 Firmware Dump — Fullhan FH8852V201
 
-Full flash dump from a KEVIEW H43 IP camera for OpenIPC development.
+Reverse-engineering an unsupported Fullhan SoC for [OpenIPC](https://openipc.org/): a full flash
+dump plus a growing set of clean-room libraries that replace the closed vendor SDK one piece at
+a time — ISP bring-up, sensor driver, DMA buffer wiring — each one derived from decompiling the
+vendor binary and the kernel modules it talks to, not from documentation (there isn't any).
+
+**Why this exists:** the FH8852V201 has no OpenIPC board support, no public SDK, and no upstream
+`majestic` build — Fullhan ships the vendor SDK statically linked into one 6MB stripped binary
+(`ipcam`) with no separate `.so` libraries to link against, so there's nothing for OpenIPC's
+`majestic` streamer to link against either. The only way in is reading `ipcam` itself, and the
+two unstripped kernel modules (`isp.ko`, `vmm.ko`) it drives via ioctl.
+
+**The target is `majestic/mini_streamer.c`** — a standalone streaming daemon that replaces
+`majestic` entirely for this chip (sensor → ISP → VPSS → encoder → RTSP out), built from
+clean-room libraries instead of a vendor SDK that doesn't exist in linkable form.
+
+**Status:** MIPI capture, VPSS pipeline, sensor I2C bring-up, and VMM allocation are confirmed
+working on real hardware. The ISP DMA buffer-address protocol — the piece that was blocking a
+first frame — is now fully reverse-engineered and reimplemented
+(`sdk/lib/isp_buf_addr.c`, derivation in `sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md`):
+every ioctl, every struct offset, every constant was read directly off the decompiled vendor
+code and kernel modules, not guessed. Untested on hardware yet — wiring it into
+`mini_streamer.c` is the next step.
 
 ## Repository Structure
 
@@ -10,8 +31,8 @@ firmware/
   modules/             # Kernel modules (.ko) — ISP, encoder, JPEG, motor, NNA, etc.
   binaries/            # ipcam binary, run.sh, load_driver.sh, ARC firmware
 sdk/
-  headers/             # Reconstructed FH8852V201 SDK headers (from Ghidra)
-  lib/                 # Clean-room libraries: fh_mpi, isp_init, cv2003 sensor driver
+  headers/             # Reconstructed FH8852V201 SDK headers + protocol derivations (from Ghidra)
+  lib/                 # Clean-room libraries: fh_mpi, isp_init, isp_buf_addr, cv2003 sensor driver
   tools/               # Standalone utilities: I2C scanner, register dumpers, smoke test
   tests/               # Reference tests (proc config discovery, GET_FRAME timeout fix)
     archive/           # 40+ experimental tests from ISP bringup campaign (all failed)
@@ -169,8 +190,24 @@ init → /usr/app/run.sh
 |------|---------|
 | 80 | HTTP (thttpd — web UI + ONVIF) |
 | 554 | RTSP (2 streams per channel) |
-| 2360 | Telnet (BusyBox ash) |
+| 2360 | Telnet (BusyBox ash, root:`ipc@hs66`) |
 | 9101 | WebSocket (video player) |
+
+### Quick Connect
+
+```bash
+# Telnet (must be enabled via web UI first)
+telnet 192.168.1.88 2360
+# login: root
+# password: ipc@hs66
+
+# RTSP main stream
+ffplay rtsp://192.168.1.88:554/stream1
+
+# Web UI
+open http://192.168.1.88
+# login: admin / 123456
+```
 
 ## RTSP URL Format (decompiled)
 
@@ -1079,6 +1116,133 @@ int m_account_need_check_auth(void) {
 | Auth | ~15 | `m_account_*`, `m_authentication_*` |
 | Encryption | ~30 | `aes_*`, `packet_aes_*`, `pprpc_packet_encrypt_*` |
 
+## Sensor I2C Communication (decompiled from ipcam)
+
+The sensor I2C is handled entirely in **userspace** by the ipcam binary through standard Linux I2C:
+
+### I2C Architecture
+
+| Layer | Component | I2C Role |
+|-------|-----------|----------|
+| Kernel | `fh_i2c` driver (built-in, not a module) | Provides `/dev/i2c-0` at `0xF0200000` |
+| Kernel | `isp.ko` | No I2C — only ISP MMIO at `0xE8400000` |
+| Kernel | `media_process.ko` | No I2C — buffer/pipeline management only |
+| Userspace | `ipcam` binary | All sensor I2C via `/dev/i2c-0` |
+
+### SensorDevice_Init (decompiled)
+
+```c
+// Opens /dev/i2c-0 for I2C sensors, /dev/spi1 for SPI sensors (mode >= 4)
+int SensorDevice_Init(uint16_t slave_addr, uint8_t addr_mode) {
+    fd = open("/dev/i2c-0", O_RDWR | O_NONBLOCK);  // 0x802
+    ioctl(fd, 0x704, 0);           // I2C_TENBIT = disable 10-bit
+    ioctl(fd, 0x706, slave_addr);  // I2C_SLAVE = set 7-bit address
+    // All subsequent transfers use:
+    // ioctl(fd, 0x707, &msgs);    // I2C_RDWR
+}
+```
+
+### Address Mode (stored at 0x0077a90c)
+
+| Mode | Register Address | Data Width | Used By |
+|------|-----------------|------------|---------|
+| 0 | 8-bit | 8-bit | — |
+| 1 | 8-bit | 16-bit | — |
+| 2 | 16-bit | 8-bit | **CV2003**, GC2053, GC2063, GC2083, GC2093 |
+| 3 | 16-bit | 16-bit | IMX307 |
+
+### CV2003 Sensor Probe (decompiled from FUN_0030d75c)
+
+```c
+// Tries 2 candidate I2C addresses
+for (i = 0; i < 2; i++) {
+    SensorDevice_Init(candidate_addrs[i] >> 1, 2);  // mode=2: 16-bit addr, 8-bit data
+    pid1 = Sensor_Read(0x307a);
+    pid2 = Sensor_Read(0x3138);
+    printf("addr=0x%x,pid1=%x,pid2=%x\n", candidate_addrs[i], pid1, pid2);
+    SensorDevice_Close();
+    if ((pid1 == 0x02 || pid1 == 0x20) && pid2 == 0x03) {
+        // CV2003 detected!
+        break;
+    }
+}
+```
+
+### CV2003 Init Sequence (decompiled from FUN_0030de78)
+
+```c
+puts("cv2003 20231011 1lane");
+// 1. Write register init table (varies by fps mode)
+for (i = 0; i < table_length; i++) {
+    Sensor_Write(table[i].addr, table[i].val);  // via I2C_RDWR ioctl
+}
+usleep(10000);  // 10ms settle time
+// 2. Enable streaming
+Sensor_Write(0x3141, 0x01);
+// 3. Read vertical cycle for frame rate
+v_cycle = (Sensor_Read(0x3021) << 8) | Sensor_Read(0x3020);
+```
+
+### Key I2C Functions in ipcam Binary
+
+| Function | Address | Purpose |
+|----------|---------|---------|
+| `SensorDevice_Init` | `0x0030ad08` | Open `/dev/i2c-0`, set slave address |
+| `SensorDevice_Close` | `0x0030ae8c` | Close I2C fd |
+| `I2CSensor_Read` | `0x0030a93c` | Read sensor register via `I2C_RDWR` |
+| `I2CSensor_Write` | `0x0030a900` | Write sensor register via `I2C_RDWR` |
+| `I2CSensor_WriteEx` | `0x0030a21c` | Write with error suppression option |
+| `I2CSensor_WriteEx_Multi` | `0x0030a400` | Multi-register write |
+| `Sensor_Read` | `0x0030ab70` | High-level read (I2C or SPI) |
+| `Sensor_Write` | `0x0030ac20` | High-level write (I2C or SPI) |
+| `p_i2c_read` | `0x002a2e4c` | Stub (returns -1) — unused |
+| `p_i2c_write` | `0x002a2e7c` | Stub (returns -1) — unused |
+
+### Global I2C State (in ipcam BSS)
+
+| Address | Type | Description |
+|---------|------|-------------|
+| `0x0077a904` | `char*` | Device path (`"/dev/i2c-0"` or `"/dev/spi1"`) |
+| `0x0077a908` | `int` | File descriptor (-1 when closed) |
+| `0x0077a90c` | `uint8` | Address mode (0-3 for I2C, >=4 for SPI) |
+| `0x0077a90e` | `uint16` | I2C slave address (7-bit) |
+
+### Verified I2C Communication (2026-04-07)
+
+Live test using `test_i2c_raw.c` (raw syscalls, no libc) confirmed sensor access:
+
+```
+/dev/i2c-0 @ 0x35:
+  [1] open("/dev/i2c-0", O_RDWR|O_NONBLOCK) ... OK fd=3
+  [2] ioctl(fd, I2C_TENBIT=0x704, 0)        ... OK
+  [3] ioctl(fd, I2C_SLAVE=0x706, 0x35)      ... OK
+  [4] I2C_RDWR read reg 0x307a (PID1)       ... OK => 0x02 MATCH
+  [5] I2C_RDWR read reg 0x3138 (PID2)       ... OK => 0x03 MATCH
+  >>> CV2003 DETECTED! <<<
+  [6] I2C_RDWR read reg 0x3021 (v_cycle hi) ... OK => 0x0a
+  [7] I2C_RDWR read reg 0x3020 (v_cycle lo) ... OK => 0x8c
+  v_cycle = 0x0a8c (2700 lines)
+```
+
+**Confirmed parameters:**
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| I2C bus | `/dev/i2c-0` | Kernel built-in `fh_i2c` driver at `0xF0200000` |
+| Slave address | `0x35` (7-bit) / `0x6A` (8-bit write) | Second candidate `0x36` returns EREMOTEIO |
+| Address mode | 2 (16-bit register, 8-bit data) | Big-endian register address |
+| Chip ID | PID1=`0x02` (reg `0x307a`), PID2=`0x03` (reg `0x3138`) | Matches decompiled detect logic |
+| V_cycle | 2700 lines (`0x0A8C`) | At 30fps = 81,000 lines/sec |
+| Other buses | `/dev/i2c-1`, `/dev/i2c-2` exist but timeout (-110) | No sensors on those buses |
+
+### Why Our Earlier I2C Scan Failed
+
+Our earlier `scan_i2c.c` found zero devices because it was missing the `I2C_TENBIT` ioctl setup step. The correct sequence (from ipcam decompilation) requires all three ioctls in order:
+1. `ioctl(fd, I2C_TENBIT, 0)` — disable 10-bit addressing
+2. `ioctl(fd, I2C_SLAVE, addr)` — set 7-bit slave address
+3. `ioctl(fd, I2C_RDWR, &msgs)` — combined read/write transfer
+
+**I2C works even while ipcam is running** — no exclusive lock issue. The sensor responds on `/dev/i2c-0` at address `0x35` at all times.
+
 ## OpenIPC Porting Status
 
 ### What This Dump Provides for OpenIPC
@@ -1091,7 +1255,7 @@ int m_account_need_check_auth(void) {
 | RT-Thread firmware | **Complete** | ARC co-processor binary |
 | Boot args & memory map | **Complete** | Kernel cmdline, `/proc/iomem`, IRQ table |
 | Driver load order | **Complete** | `load_driver.sh` with GPIO sequence |
-| Sensor identification | **Complete** | CV2003 MIPI 1-lane, internal ID 0x14 |
+| Sensor identification | **Complete** | CV2003 MIPI 1-lane, internal ID 0x14, I2C `0x35` on `/dev/i2c-0` — **verified live** |
 | AI model | **Complete** | `persondet.nbg` (1.3MB) |
 | Fullhan SDK API | **Complete** | 135+ functions reverse-engineered (FH_VENC, FH_VPSS, FHAdv_Isp, FHAdv_Osd, FH_BGM, FHAdv_SmartIR) |
 | Peripheral register map | **Complete** | 24 peripherals with addresses and IRQs |
@@ -1106,7 +1270,7 @@ int m_account_need_check_auth(void) {
 | **Toolchain** | Need `arm-fullhanv3-linux-uclibcgnueabi-gcc 6.5.0` | Available in [Tuya IoTOS SDK](https://github.com/tuya/tuya-iotos-embeded-sdk-multimedia) or build via Buildroot/crosstool-ng |
 | **Kernel .config** | `CONFIG_IKCONFIG` was off, no `/proc/config.gz` | OpenIPC builds their own kernel config; peripheral map above helps |
 | **Board file** | No device tree — uses legacy board files | Register map from `/proc/iomem` above provides all addresses |
-| **Sensor driver source** | CV2003 driver in `ipcam` binary, not separate `.ko` | Sensor probe sequence decompiled; I2C on bus 0 at `0xF0200000` |
+| **Sensor driver source** | **Decompiled** — CV2003 driver fully extracted from `ipcam` binary | CV2003 I2C init fully decompiled from ipcam binary — SensorDevice_Init, detect, and register tables all extracted |
 | **Majestic streamer** | No Fullhan support in majestic yet | All FH_VENC/FH_VPSS API functions documented above |
 
 ### Current OpenIPC Fullhan Status
