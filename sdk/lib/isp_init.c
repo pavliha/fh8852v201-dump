@@ -48,11 +48,16 @@
  * previously called BEFORE the Ispp/Ispf equivalents, which did not
  * match the vendor order.
  *
- * isp_module_bypass's real trigger (a 0-vs-nonzero check on an upstream
- * parameter) isn't resolvable from this file alone; isp_apply_module_bypass()
- * below assumes the common/default path (parameter 0) and performs the
- * single confirmed bit-set unconditionally — flagged as an assumption,
- * not a guess about the bit's own meaning or value.
+ * isp_module_bypass's trigger (2026-10-18 update): traced to
+ * `*(isp_core + 0x1bac)` via the real call site's raw disassembly
+ * (Ghidra's decompile of that call was wrong — it showed 12 arguments;
+ * the function body only reads r0). `isp_core` is entirely `.bss`
+ * (confirmed from the ELF section headers), so that field is 0 by
+ * default at process start, and isp_core_init runs at the very start of
+ * bring-up — well-evidenced, not just assumed, that the 0 path is real,
+ * though not exhaustively proven (no earlier writer to this one field
+ * was ruled out among isp_core's other references). See
+ * isp_apply_module_bypass() below.
  *
  * STILL UNRESOLVED regardless of value accuracy: whether writing any of
  * these registers via /dev/mem while isp.ko is loaded is safe at all (the
@@ -711,8 +716,17 @@ static void isp_ispf_init(isp_ctx_t *ctx)
 /**
  * Single confirmed bit-set from `isp_module_bypass` (register 0x2c, bit
  * 0x400). The vendor function only performs this when its caller-supplied
- * parameter is 0; that parameter's real value isn't resolvable from this
- * file alone, so this assumes the common/default (0) path. See file header.
+ * parameter is 0. That parameter is `*(isp_core + 0x1bac)`, traced from
+ * the real call site's raw ARM disassembly (not the decompile, which
+ * mis-showed 12 arguments — the `ldmia` there loads 4 registers but the
+ * function body only ever reads r0; the other 3 are dead). `isp_core`
+ * lives entirely in `.bss` (confirmed from the ELF section headers), so
+ * that field defaults to 0 at process start, and isp_core_init runs at
+ * the very beginning of ISP bring-up — strong evidence the 0 path is the
+ * real one, though no exhaustive check was done for some other, earlier
+ * writer to this one specific field among isp_core's ~40 other
+ * references. Upgraded from "assumed" to "well-evidenced default," not a
+ * fully proven fact.
  */
 static void isp_apply_module_bypass(isp_ctx_t *ctx)
 {

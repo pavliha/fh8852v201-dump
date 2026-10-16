@@ -79,11 +79,17 @@ string-pointer writes, `0x5b0`/`0x5d4`). Plus: a 129-word table (`Tab_drc_klcurv
 **`isp_startup_Isp_PkgEnable`** (3 writes, already matched the pre-existing code exactly):
 register `0x100 = 4`, register `0x034 = 5`, then `0x100 |= 1`.
 
-**`isp_module_bypass`** (1 conditional write, trigger unresolved): register `0x02C |= 0x400`,
-only when the caller's parameter is 0. That parameter's real runtime value isn't resolvable from
-this file alone (the call site's apparent 12 arguments are a decompiler artifact — the function
-body itself takes exactly one parameter). `isp_apply_module_bypass()` assumes the 0 path
-unconditionally; flagged as an assumption, not a resolved fact.
+**`isp_module_bypass`** (1 conditional write, trigger now well-evidenced, not just assumed):
+register `0x02C |= 0x400`, only when the caller's parameter is 0. Ghidra's decompile of the call
+site showed 12 apparent arguments — a decompiler artifact; the function body only ever reads r0.
+Tracing the real call site's raw ARM disassembly (not the decompile) shows the true argument is
+`*(isp_core + 0x1bac)`. `isp_core` lives entirely in `.bss` (confirmed from the ELF section
+headers: `.bss` spans `0x5e1d60`-`0x780bac`, `isp_core` sits at `0x7707a0`), so that field is 0
+by default at process start, and `isp_core_init` runs at the very beginning of ISP bring-up —
+strong evidence the 0 path is the real one. Not exhaustively proven: no check was done across
+`isp_core`'s ~40 other static references for some earlier writer to this one specific field.
+`isp_apply_module_bypass()` performs the bit-set unconditionally, now on stronger footing than a
+bare assumption.
 
 **`sensorDp_setAttribute2Isp`** (2026-10-17 addendum — resolved, previously flagged as
 unresolvable dynamic dispatch): Ghidra's initial decompile of this function's indirect-call site
