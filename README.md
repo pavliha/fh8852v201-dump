@@ -33,6 +33,20 @@ and kernel modules, not guessed:
   channel-indexed (checked `< 5` channels in the vendor binary), and `FH_VPSS_SysInitMem`'s own
   real init loops per-channel memory setup over every channel with nonzero capability —
   `vpss_setup()` now follows that same structure instead of being hand-extended on faith.
+- **ISP register-table values** — the part of this project explicitly flagged as "no vendor
+  register values copied" is no longer that. `sdk/lib/isp_init.c`'s register writes are now
+  byte-exact from decompiling `isp_startup_Ispp_Init`/`Ispf_Init`/`Isp_PkgEnable`/
+  `isp_core_system_reset`, including two full lookup tables (gamma and DRC curve) read directly
+  off the binary. The real top-level bring-up order was also wrong in a way that mattered —
+  buffer-address allocation runs *before* the register table in the real vendor code, not after
+  — now fixed. Full derivation in `sdk/headers/ISP_REGISTER_TABLE_V201.md`.
+
+This does **not** resolve the project's actual standing blocker: whether writing ISP registers
+via `/dev/mem` while `isp.ko` is loaded is safe at all. That's a question about the access
+mechanism (a possible memory-attribute mismatch or IRQ race with the kernel module's own mapping
+of the same physical address), completely independent of whether the values being written are
+correct. Byte-exact values reduce the chance a *wrong value* causes a hang or bad image; they
+don't touch the access-safety question, which still needs real hardware to resolve.
 
 `majestic/mini_streamer.c` now wires the whole pipeline together — device opens, MIPI, VPSS
 (two channels), sensor I2C, buffer-address protocol, and the confirmed VENC layer (two channels)

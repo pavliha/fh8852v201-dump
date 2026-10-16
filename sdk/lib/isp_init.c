@@ -1,21 +1,63 @@
 /**
  * Clean-room ISP hardware initialization.
  *
- * Based on ISP_REGISTER_SPEC.md — register purposes derived from
- * Ghidra decompilation of function names and parameter analysis.
- * No vendor register values copied — all values computed from
- * sensor resolution, standard signal processing theory, and
- * documented register semantics.
+ * REGISTER VALUES (2026-10-17 revision): isp_ispp_init()/isp_ispf_init()/
+ * isp_pkg_enable()/isp_reset() below are byte-for-byte extracted from
+ * decompiling ipcam's real isp_startup_Ispp_Init / isp_startup_Ispf_Init /
+ * isp_startup_Isp_PkgEnable / isp_core_system_reset — not derived from
+ * theory, not guessed, replacing this file's original "computed from
+ * sensor resolution and documented register semantics" values entirely
+ * for those four functions.
  *
- * CORRECTION (2026-10-17): the comment below originally said call this
- * BEFORE ioctl 0x690A. Decompiling the real isp_core_init this session
- * showed the opposite — it issues ioctl 0x690A as its very first
- * operation, before its own isp_mmap or any register write. isp_hw_init()
- * should be called AFTER ioctl 0x690A, not before. Not yet re-verified on
- * hardware; this is a correction to the ordering assumption, not proof the
- * registers themselves are now safe to write (see
- * sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md and mini_streamer.c's header
- * for the still-unresolved crash risk this function carries).
+ * Base-pointer validation: these functions all write through
+ * isp_core+0x1378 (`iVar1` in the decompile). That field is also exactly
+ * what isp_core_system_reset itself uses (`isp_core._4984_4_` — 4984
+ * decimal == 0x1378), and system_reset's two bitfield writes already
+ * matched this file's pre-existing isp_reset() exactly before this
+ * revision — strong independent evidence that isp_core+0x1378 really is
+ * the /dev/mem-mapped ISP register base (same thing isp_mmap() returns),
+ * not a separate software struct that happens to share a similar name.
+ *
+ * Two writes in the real Ispf_Init (register offsets 0x5b0 and 0x5d4)
+ * write ASCII-string pointers ("s_mtx_init", "son_auto_reboot") rather
+ * than control values — almost certainly a debug/log scratch region
+ * sharing the same physical aperture, not functional ISP control state.
+ * A pointer value is process-specific (ipcam's own text-segment address)
+ * and not meaningfully reproducible in a different binary, so those two
+ * writes are intentionally NOT replicated here; every purely numeric
+ * write around them is reproduced exactly.
+ *
+ * isp_set_pic_size() below is UNCHANGED from before this revision:
+ * SetInputPicSize/SetIspPicSize/SetIspPicCut/SetLscTab/SetNr3dDrcWin/
+ * SetNr3dTab/SetCnrExpTab/SetDehazeTab (the resolution-dependent helper
+ * functions isp_startup_IspInPicCfg calls) were not decompiled this
+ * round, so those specific register offsets/values remain derived from
+ * theory, not confirmed. IspInPicCfg also does one small confirmed
+ * bitfield write to register 0x28 driven by an input byte
+ * (`*(isp_core+0xd)`, likely sensor orientation/mirror) that has no
+ * equivalent source in this file's simpler ctx — intentionally not
+ * replicated rather than guessing that input.
+ *
+ * Call order fixed this revision to match the real isp_startup
+ * (confirmed from decompile): Ispp_Init, then Ispf_Init, then the
+ * picture-size config, then module bypass — isp_set_pic_size was
+ * previously called BEFORE the Ispp/Ispf equivalents, which did not
+ * match the vendor order.
+ *
+ * isp_module_bypass's real trigger (a 0-vs-nonzero check on an upstream
+ * parameter) isn't resolvable from this file alone; isp_apply_module_bypass()
+ * below assumes the common/default path (parameter 0) and performs the
+ * single confirmed bit-set unconditionally — flagged as an assumption,
+ * not a guess about the bit's own meaning or value.
+ *
+ * STILL UNRESOLVED regardless of value accuracy: whether writing any of
+ * these registers via /dev/mem while isp.ko is loaded is safe at all (the
+ * memory-attribute-mismatch/IRQ-race risk documented in
+ * ISP_BUF_ADDR_PROTOCOL_V201.md and mini_streamer.c's header). Byte-exact
+ * values reduce the chance a wrong VALUE causes a hang or bad image, but
+ * they do not address that separate, still-untested access-safety
+ * question — this file's registers are still only safe to write BEFORE
+ * isp.ko's own concurrent access begins, if at all.
  */
 
 #include <stdio.h>
@@ -29,7 +71,7 @@
 #include "isp_init.h"
 
 #define ISP_REG_BASE  0xE8400000
-#define ISP_REG_SIZE  0x4000   /* 16KB mapped for safety */
+#define ISP_REG_SIZE  0x3240   /* exact vendor isp_mmap size, confirmed from isp_core_init */
 
 /**
  * Map ISP hardware registers via /dev/mem.
@@ -52,24 +94,23 @@ int isp_mmap(isp_ctx_t *ctx, uint32_t width, uint32_t height)
 }
 
 /**
- * Step 1: ISP soft reset.
- * From decompiled `isp_core_system_reset`:
- *   Register 0x0F0 bit 4 = soft reset trigger
- *   Register 0x0F4 bit 1 = secondary reset
+ * ISP soft reset. Confirmed byte-exact from `isp_core_system_reset`:
+ *   Register 0x0F0: (reg & 0xFFFFFFCF) | 0x10
+ *   Register 0x0F4: (reg & 0xFFFFFFFC) | 0x02
  */
 static void isp_reset(isp_ctx_t *ctx)
 {
     volatile uint32_t *R = ctx->regs;
-    R[0x0F0/4] = (R[0x0F0/4] & ~0x30) | 0x10;  /* set bit 4 */
-    R[0x0F4/4] = (R[0x0F4/4] & ~0x03) | 0x02;   /* set bit 1 */
-    usleep(1000); /* 1ms settle */
+    R[0x0F0/4] = (R[0x0F0/4] & 0xFFFFFFCF) | 0x10;
+    R[0x0F4/4] = (R[0x0F4/4] & 0xFFFFFFFC) | 0x02;
+    usleep(1000); /* 1ms settle — our own addition, not in the vendor function */
 }
 
 /**
- * Step 2: Configure picture size registers.
- * From decompiled `SetInputPicSize` and `SetIspPicSize`:
- *   Format: (width - 1) | ((height - 1) << 16)
- *   Multiple registers hold the same size for different pipeline stages.
+ * Step 2 (derived, NOT confirmed): picture size / crop / stride / stat-window
+ * registers. See file header — isp_startup_IspInPicCfg's own helper functions
+ * were not decompiled this revision, so these values are still computed from
+ * resolution and documented register semantics, not vendor-exact.
  */
 static void isp_set_pic_size(isp_ctx_t *ctx)
 {
@@ -77,203 +118,340 @@ static void isp_set_pic_size(isp_ctx_t *ctx)
     uint32_t w = ctx->width;
     uint32_t h = ctx->height;
 
-    /* Full resolution: (w-1) | (h-1)<<16 */
     uint32_t full_size = (w - 1) | ((h - 1) << 16);
 
-    /* Input and ISP processing size */
-    R[0x130/4] = full_size;   /* SetInputPicSize: input */
-    R[0x144/4] = full_size;   /* SetInputPicSize: input duplicate */
-    R[0x138/4] = full_size;   /* SetIspPicSize: ISP processing */
-    R[0x0D0/4] = full_size;   /* SetIspPicSize: copy */
+    R[0x130/4] = full_size;
+    R[0x144/4] = full_size;
+    R[0x138/4] = full_size;
+    R[0x0D0/4] = full_size;
 
-    /* Crop: no crop (0,0) */
-    R[0x134/4] = 0;           /* SetIspPicCut */
+    R[0x134/4] = 0;
     R[0x148/4] = 0;
 
-    /* Sub-resolution for preview: width/3 x height/2.25 ≈ 640x480 */
     uint32_t sub_w = w / 3;
-    uint32_t sub_h = h * 4 / 9;  /* maintain ~16:9 aspect */
+    uint32_t sub_h = h * 4 / 9;
     R[0x14C/4] = (sub_w - 1) | ((sub_h - 1) << 16);
 
-    /* Buffer stride: raw Bayer = 10 bits per pixel, aligned to 8 bytes */
     uint32_t raw_stride = (((w * 10 + 7) / 8) + 7) & ~7;
     uint32_t q_stride = ((((w / 4) * 10) / 8) + 7) & ~7;
 
     R[0x2E8/4] = raw_stride;
-    R[0x2F0/4] = raw_stride | 0x80000000;  /* enable bit */
+    R[0x2F0/4] = raw_stride | 0x80000000;
     R[0x308/4] = q_stride;
     R[0x310/4] = q_stride | 0x80000000;
     R[0x318/4] = q_stride;
     R[0x320/4] = q_stride | 0x80000000;
 
-    /* Block size for AE/AWB statistics */
     uint32_t blk_w = (w / 32) - 1;
     uint32_t blk_h = (h / 32) - 1;
     R[0x490/4] = (blk_h << 24) | ((w / 48 - 1) << 16);
 
-    /* AE window config */
     R[0x4E0/4] = (blk_w | (blk_h << 8)) | 0x0F0F0000;
     R[0x4E4/4] = 0;
     R[0x4E8/4] = 0x1FFF1;
 
-    /* NR3D/DRC window: from `SetNr3dDrcWin` */
     R[0x500/4] = 0;
     R[0x504/4] = 0;
     R[0x508/4] = blk_w | (blk_h << 16) | 0x78007800;
 }
 
-/**
- * Step 3: Enable ISP processing modules.
- * From decompiled `isp_startup_Ispp_Init`:
- *   Module enable register controls which ISP blocks are active.
- *   Tone mapping curves set the dynamic range response.
+/*
+ * Gamma-derived table copied into registers 0x1a40.. by the real
+ * isp_startup_Ispp_Init (read via read_bytes at ipcam's Tab_gamma, 80
+ * words / 320 bytes, 2026-10-17).
  */
-static void isp_enable_modules(isp_ctx_t *ctx)
+static const uint32_t ISP_GAMMA_TABLE[80] = {
+    0x00050000, 0x000f000a, 0x00190014, 0x0022001e, 0x002c0027, 0x00350031, 0x003e003a, 0x00470043,
+    0x0050004c, 0x00590055, 0x0062005d, 0x006a0066, 0x0073006f, 0x007b0077, 0x0083007f, 0x008b0087,
+    0x0093008f, 0x009b0097, 0x00a3009f, 0x00aa00a7, 0x00b200ae, 0x00b900b6, 0x00c100bd, 0x00c800c4,
+    0x00cf00cb, 0x00d600d3, 0x00dd00d9, 0x00e400e0, 0x00eb00e7, 0x00f100ee, 0x00f800f5, 0x00fe00fb,
+    0x010e0102, 0x0127011b, 0x013e0132, 0x01540149, 0x0169015f, 0x017d0173, 0x01910187, 0x01a3019a,
+    0x01b501ac, 0x01c601be, 0x01d601ce, 0x01e601de, 0x01f501ee, 0x020401fd, 0x0212020b, 0x021f0219,
+    0x022c0226, 0x02390233, 0x0245023f, 0x0251024b, 0x025c0256, 0x02670262, 0x0272026c, 0x027c0277,
+    0x02940281, 0x02b702a6, 0x02d702c7, 0x02f302e5, 0x030c0300, 0x03230318, 0x0338032e, 0x034b0342,
+    0x035d0354, 0x036d0365, 0x037c0375, 0x038a0383, 0x03970391, 0x03a3039d, 0x03ae03a9, 0x03b903b4,
+    0x03c303be, 0x03cc03c7, 0x03d503d0, 0x03dd03d9, 0x03e503e1, 0x03ec03e8, 0x03f303f0, 0x03fa03f6,
+};
+
+/**
+ * ISP processing-pipeline module enable + tone-curve registers. Confirmed
+ * byte-exact from `isp_startup_Ispp_Init` (2026-10-17).
+ */
+static void isp_ispp_init(isp_ctx_t *ctx)
 {
     volatile uint32_t *R = ctx->regs;
 
-    /* Enable modules — use conservative set (not all modules) */
-    R[0x010/4] = 0x0003FFFF;
-    R[0x014/4] = 0x00001FFF;
-    R[0x018/4] = 0x0007FFFF;
-
-    /* Tone mapping curve 1: standard gamma-like response
-     * Each byte represents output value for input quartile */
-    R[0x080/4] = 0x60502010;   /* shadows: 0x10,0x20,0x50,0x60 */
-    R[0x084/4] = 0x908F8070;   /* midtones */
-    R[0x088/4] = 0xD0C0B0A0;   /* highlights */
-    R[0x08C/4] = 0x00FFF0E0;   /* peak */
-
-    /* Gamma pre-curve: linear (identity) */
+    R[0x008/4] = 0x7ffffff;
+    R[0x080/4] = 0x50402010;
+    R[0x084/4] = 0x90807060;
+    R[0x088/4] = 0xd0c0b0a0;
+    R[0x08c/4] = 0xfff0e0;
     R[0x090/4] = 0x10101010;
-    R[0x094/4] = 0x00101010;
+    R[0x094/4] = 0x10101010;
     R[0x098/4] = 0x10101010;
-    R[0x09C/4] = 0x000F1010;
-
-    /* Tone mapping curve 2: standard S-curve */
-    R[0x0A0/4] = 0x50482820;
-    R[0x0A4/4] = 0x69686058;
-    R[0x0A8/4] = 0xA8987870;
-    R[0x0AC/4] = 0xE8E0C8B8;
-    R[0x0B0/4] = 0x00FFF8F0;
-
-    /* Statistics config */
+    R[0x09c/4] = 0xf1010;
+    R[0x0a0/4] = 0x30281810;
+    R[0x0a4/4] = 0x50484038;
+    R[0x0a8/4] = 0x80706058;
+    R[0x0ac/4] = 0xc8c0a090;
+    R[0x0b0/4] = 0xe0d8d0;
+    R[0x0b4/4] = 0;
+    R[0x0b8/4] = 0;
     R[0x494/4] = 0x9015;
-
-    /* Clear statistic accumulators */
-    R[0x13C/4] = 0;
+    R[0x13c/4] = 0;
     R[0x140/4] = 0;
     R[0x150/4] = 0;
     R[0x154/4] = 0;
     R[0x578/4] = 0;
-    R[0x57C/4] = 0;
+    R[0x57c/4] = 0;
+
+    /*
+     * Gamma table fan-out, confirmed from the real copy loop: each
+     * table word is written raw at +0x3c0, and left-shifted by 2 at
+     * +0, +0x140, +0x280 (all relative to register offset 0x1a40).
+     */
+    for (size_t i = 0; i < 80; i++) {
+        uint32_t raw = ISP_GAMMA_TABLE[i];
+        uint32_t shifted = raw << 2;
+        R[(0x1a40 + i * 4) / 4] = shifted;
+        R[(0x1b80 + i * 4) / 4] = shifted;
+        R[(0x1cc0 + i * 4) / 4] = shifted;
+        R[(0x1e00 + i * 4) / 4] = raw;
+    }
 }
 
-/**
- * Step 4: Initialize ISP filters.
- * From decompiled `isp_startup_Ispf_Init`:
- *   Sets up noise reduction, color correction, and image enhancement.
- *   Using identity/default values for clean output.
+/*
+ * DRC k-L curve table copied into registers 0x690.. by the real
+ * isp_startup_Ispf_Init (read via read_bytes at ipcam's Tab_drc_klcurve,
+ * 129 words / 516 bytes, 2026-10-17).
  */
-static void isp_init_filters(isp_ctx_t *ctx)
+static const uint32_t ISP_DRC_KLCURVE_TABLE[129] = {
+    0x03000000, 0x03fe037b, 0x050e0484, 0x0629059a, 0x074b06ba, 0x087307de, 0x099d0908, 0x0aca0a33,
+    0x0bf90b61, 0x0d280c90, 0x0e570dbf, 0x0f850eee, 0x10b3101c, 0x11e0114a, 0x130b1275, 0x1433139f,
+    0x155b14c8, 0x167f15ee, 0x17a11711, 0x18c11832, 0x19de1950, 0x1af71a6b, 0x1c0e1b83, 0x1d221c99,
+    0x1e321daa, 0x1f3f1eb9, 0x20481fc4, 0x214e20cb, 0x224f21cf, 0x234e22cf, 0x244823cc, 0x253f24c5,
+    0x26aa25b9, 0x28812798, 0x2a482967, 0x2bff2b26, 0x2da72cd5, 0x2f3e2e74, 0x30c63004, 0x323e3184,
+    0x33a732f5, 0x35013456, 0x364c35a8, 0x378836eb, 0x38b53820, 0x39d53947, 0x3ae83a60, 0x3bed3b6c,
+    0x3d5e3c6b, 0x3f213e45, 0x40bc3ff3, 0x4233417b, 0x439042e4, 0x44dd4438, 0x46214580, 0x475d46c0,
+    0x489047f7, 0x49bc4927, 0x4ae14a4f, 0x4bff4b70, 0x4d164c8b, 0x4e284da0, 0x4f344eaf, 0x503b4fb8,
+    0x51bb50bc, 0x53ac52b6, 0x558b549e, 0x575b5675, 0x591d583e, 0x5ad159f8, 0x5c795ba6, 0x5e155d48,
+    0x5fa75ee0, 0x612f606d, 0x62ae61f0, 0x6424636a, 0x659264dc, 0x66f86646, 0x685767a9, 0x69af6904,
+    0x6ba76a58, 0x6e316cef, 0x70a66f6e, 0x730671d8, 0x7554742f, 0x77917674, 0x79be78a9, 0x7bdd7acf,
+    0x7dee7ce7, 0x7ff37ef2, 0x81ed80f1, 0x83db82e5, 0x85bf84ce, 0x879986ad, 0x896b8883, 0x8b338a50,
+    0x8dd28c15, 0x91358f87, 0x947e92dd, 0x97ae9619, 0x9ac9993e, 0x9dcf9c4e, 0xa0c29f4b, 0xa3a5a236,
+    0xa678a511, 0xa93da7dd, 0xabf5aa9b, 0xaea0ad4c, 0xb140aff1, 0xb3d5b28c, 0xb660b51c, 0xb8e2b7a2,
+    0xbc95ba20, 0xc169bf03, 0xc621c3c8, 0xcac2c874, 0xcf4dcd0a, 0xd3c5d18b, 0xd82dd5fb, 0xdc87da5c,
+    0xe0d4deaf, 0xe516e2f6, 0xe94ee733, 0xed7deb66, 0xf1a5ef92, 0xf5c7f3b7, 0xf9e4f7d6, 0xfdfcfbf1,
+    0x00010007,
+};
+
+/**
+ * ISP filter/color-correction register block. Confirmed byte-exact from
+ * `isp_startup_Ispf_Init` (2026-10-17). Two writes present in the real
+ * function (offsets 0x5b0, 0x5d4 — ASCII-string pointers, not control
+ * values) are intentionally omitted; see file header.
+ */
+static void isp_ispf_init(isp_ctx_t *ctx)
 {
     volatile uint32_t *R = ctx->regs;
 
-    /* Filter control */
-    R[0x0E0/4] = 0x00400000;
-    R[0x0E4/4] = R[0x0E4/4] | 2;  /* enable filter pipeline */
+    R[0x0e0/4] = 0x400102;
+    R[0x0e4/4] = R[0x0e4/4] | 2;
+    R[0x400/4] = 1;
+    R[0x404/4] = 0xf001f4a0;
+    R[0x408/4] = 0xf001f4a0;
+    R[0x40c/4] = 0xf001f4a0;
+    R[0x410/4] = 0xf001f4a0;
+    R[0x414/4] = 0x1fff009c;
+    R[0x1c4/4] = 0xc;
+    R[0x510/4] = 0x400;
+    R[0x514/4] = 0x3ffffbff;
+    R[0x518/4] = 0x3ff00001;
+    R[0x51c/4] = 0x3feffc00;
+    R[0x520/4] = 0xffbfe;
+    R[0x50c/4] = 0x100fff;
+    R[0x548/4] = 0xfff;
+    R[0x54c/4] = 0xfff0000;
+    R[0x550/4] = 0xfff;
+    R[0x554/4] = 0xfff0fff;
+    R[0x558/4] = 0xfff0000;
+    R[0x55c/4] = 0xfff0fff;
+    R[0x538/4] = 0x40;
+    R[0x53c/4] = 0;
+    R[0x570/4] = 0x20002e4;
+    R[0x574/4] = 0x35c0200;
+    R[0x578/4] = 0;
+    R[0x57c/4] = 0;
+    R[0xc2c/4] = 0x404;
+    R[0xc30/4] = 0x10000404;
+    R[0xc34/4] = 0x786e6868;
+    R[0xc38/4] = 0x7e7a7a78;
+    R[0xc3c/4] = 0x8000000;
+    R[0xc40/4] = 0xa140204;
+    R[0xc44/4] = 0xa141325;
+    R[0xc48/4] = 0x10101325;
+    R[0xc4c/4] = 0x3ff0000;
+    R[0xc50/4] = 0x1400c04;
+    R[0xc54/4] = 0x7c000606;
+    R[0xc58/4] = 0x7f7d7d7c;
+    R[0xc5c/4] = 0x6000000;
+    R[0xc60/4] = 0x1a140204;
+    R[0xc64/4] = 0x1a143425;
+    R[0xc68/4] = 0x48483425;
+    R[0xc6c/4] = 0x3fc0000;
+    R[0xc70/4] = 0x4000;
+    R[0xaac/4] = 0;
+    R[0xab0/4] = 0x160000;
+    R[0xab4/4] = 0x100010;
+    R[0xab8/4] = 0x801;
+    R[0xabc/4] = 0x1000805b;
+    R[0xac0/4] = 0x80030000;
+    R[0xac4/4] = 0x11100a10;
+    R[0xac8/4] = 0x400040;
+    R[0xacc/4] = 0x400040;
+    R[0xad0/4] = 0x400040;
+    R[0xad4/4] = 0x400040;
+    R[0xad8/4] = 0x400040;
+    R[0xadc/4] = 0x400040;
+    R[0xae0/4] = 0x400040;
+    R[0xae4/4] = 0x400040;
+    R[0xae8/4] = 0x400040;
+    R[0xaec/4] = 0x400040;
+    R[0xaf0/4] = 0x400040;
+    R[0xaf4/4] = 0x400040;
+    R[0xaf8/4] = 0x400040;
+    R[0xafc/4] = 0x400040;
+    R[0xb00/4] = 0x400040;
+    R[0xb04/4] = 0x400040;
+    R[0xb08/4] = 0x400040;
+    R[0xb0c/4] = 0x400040;
+    R[0xb10/4] = 0x400040;
+    R[0xb14/4] = 0x400040;
+    R[0xb18/4] = 0x400040;
+    R[0xb1c/4] = 0x400040;
+    R[0xb20/4] = 0x400040;
+    R[0xb24/4] = 0x400040;
+    R[0xb28/4] = 0xaa00a0;
+    R[0xb2c/4] = 0x2800280;
+    R[0xb30/4] = 0x7800780;
+    R[0xb34/4] = 0x1200120;
+    R[0xb38/4] = 0x360036;
+    R[0xb3c/4] = 0x260026;
+    R[0xb40/4] = 0x30181414;
+    R[0xb44/4] = 0x4000;
+    R[0xb48/4] = 0x80404000;
+    R[0xe00/4] = 0x40;
+    R[0xe04/4] = 0x800000;
+    R[0xe08/4] = 0xcc011c;
+    R[0xe0c/4] = 0x10101;
+    R[0xe10/4] = 0xff0000;
+    R[0xe14/4] = 0;
+    R[0xe18/4] = 0x29c0054;
+    R[0xe1c/4] = 0x29c0260;
+    R[0xe20/4] = 0x1640260;
+    R[0xe24/4] = 0x16403ac;
+    R[0xe28/4] = 0x16401a4;
+    R[0xe2c/4] = 0x36401a4;
+    R[0xa30/4] = 0x200;
+    R[0xa34/4] = 0;
+    R[0xa38/4] = 0x200;
+    R[0xa3c/4] = 0;
+    R[0xa40/4] = 0x200;
+    R[0xa44/4] = 0;
+    R[0xc74/4] = 0x105;
+    R[0xa60/4] = 0x2590132;
+    R[0xa64/4] = 0xf530074;
+    R[0xa68/4] = 0x2000ead;
+    R[0xa6c/4] = 0xe530200;
+    R[0xa70/4] = 0xfad;
+    R[0xa74/4] = 0x4000400;
+    R[0xa78/4] = 0x3ff3ff11;
+    R[0x250/4] = 0xff3983;
+    R[0x254/4] = 0x1000100;
+    R[0x258/4] = 0x1000100;
+    R[0x25c/4] = 0x80;
+    R[0x260/4] = 0x80;
+    R[0x264/4] = 0x80;
+    R[0x268/4] = 0x80;
+    R[0x26c/4] = 0x200c000;
+    R[0x278/4] = 0xc8081a0a;
+    R[0x27c/4] = 0x2408c23;
+    R[0x280/4] = 0x2d0a026;
+    R[0x284/4] = 0x6511c37;
+    R[0x288/4] = 0x1603a898;
+    R[0x28c/4] = 0x30da29f2;
+    R[0x290/4] = 0x3d0eaf6d;
+    R[0x294/4] = 0x3f8fc7e5;
+    R[0x298/4] = 0x3feff7fb;
+    R[0x29c/4] = 0x3ffffffe;
+    R[0x2a8/4] = 2;
+    R[0x2c0/4] = 0x3523120a;
+    R[0x2c4/4] = 0x9b5e9b5b;
+    R[0x2c8/4] = 0xff;
+    R[0x590/4] = 0xd;
+    R[0x594/4] = 0x30303;
+    R[0x598/4] = 0x1400a0;
+    R[0x59c/4] = 0xfc0de0;
+    R[0x5a0/4] = 0x1800c00;
+    R[0x5a4/4] = 0x334;
+    R[0x5a8/4] = 0x3e6;
+    R[0x5ac/4] = 0xff;
+    /* 0x5b0: "s_mtx_init" string pointer in the vendor binary — omitted, see file header */
+    R[0x5b4/4] = 0xc208f;
+    R[0x5b8/4] = 0x163117;
+    R[0x5bc/4] = 0x22e1c4;
+    R[0x5c0/4] = 0x3a829d;
+    R[0x5c4/4] = 0x4a2;
+    R[0x5c8/4] = 0x2b211607;
+    R[0x5cc/4] = 0x514e4639;
+    R[0x5d0/4] = 0x61c394c;
+    /* 0x5d4: "son_auto_reboot" string pointer in the vendor binary — omitted, see file header */
+    R[0x5d8/4] = 0x1340ab;
+    R[0x5dc/4] = 0x3b0263;
+    R[0x5e0/4] = 0x7a2589;
+    R[0x5e4/4] = 0xd689b1;
+    R[0x5e8/4] = 0xf1e;
+    R[0x5ec/4] = 199;
+    R[0x5f0/4] = 0x80e06080;
+    R[0x5f4/4] = 0x4006480;
+    R[0x5f8/4] = 0x4006480;
+    R[0x5fc/4] = 0xb40d9a;
+    R[0x600/4] = 0x10000cd;
+    R[0x618/4] = 0x3523120a;
+    R[0x61c/4] = 0x9b5e9b5b;
+    R[0x620/4] = 0xff;
+    R[0x664/4] = 0x20222e;
+    R[0x668/4] = 0;
+    R[0x66c/4] = 0x3f0;
 
-    /* Color correction matrix: identity (pass-through) */
-    R[0xA30/4] = 0x200;  /* R gain = 1.0 (0x200 = 512 = 1x in 9.2 fixed point) */
-    R[0xA34/4] = 0;       /* R offset = 0 */
-    R[0xA38/4] = 0x200;  /* G gain = 1.0 */
-    R[0xA3C/4] = 0;
-    R[0xA40/4] = 0x200;  /* B gain = 1.0 */
-    R[0xA44/4] = 0;
-
-    /* AWB gains: unity (1:1:1 white balance) */
-    R[0x230/4] = 0x02000200;  /* R/G ratio = 1.0 */
-    R[0x234/4] = 0x02000200;  /* B/G ratio = 1.0 */
-    R[0x250/4] = 0x00000002;  /* AWB mode */
-    R[0x254/4] = 0x00100010;  /* AWB params */
-    R[0x258/4] = 0x00100010;
-
-    /* ISP gain: 1x (0x80 = unity in 1.7 fixed point) */
-    R[0x02C/4] = 0x80;
-
-    /* ISP config register — critical for ISP operation */
-    R[0x030/4] = 0x00FEFF82;
-
-    /* Processing mode */
-    R[0x044/4] = 0x03;
-
-    /* Misc enables */
-    R[0x05C/4] = 0x00007FFF;
-    R[0x064/4] = 0x0007FFFF;
-    R[0x1C4/4] = 0x0C;
-
-    /* Filter config */
-    R[0x0E8/4] = ((ctx->height - 1) << 16) | ((ctx->width / 48) - 1);
-
-    /* ISP processing control */
-    R[0x0F0/4] = 0x09;
-    R[0x0F4/4] = 0x01010003;
-
-    /* Debug/init markers — ISP checks these */
-    R[0x104/4] = 0xFEDCBA98;
-    R[0x108/4] = 0x76543210;
-    R[0x114/4] = 0x00000C01;
-    R[0x128/4] = 0x00000500;
-
-    /* Misc */
-    R[0x178/4] = 0x00021002;
-    R[0x184/4] = 0x00010000;
-    R[0x1F0/4] = 0x03FF0000;
-    R[0x1F4/4] = 1;
-    R[0x1F8/4] = 0x03FF0000;
-    R[0x1FC/4] = 1;
-    R[0x26C/4] = 0x003FF000;
-    R[0x278/4] = 0x01000001;
-
-    /* Sharpness / APC config */
-    R[0x2AC/4] = 0x000F1F1F;
-    R[0x2B0/4] = 0x00470029;
-    R[0x2B4/4] = 0x0000003F;
-    R[0x2B8/4] = 0x238F1F0C;
-    R[0x2BC/4] = 0x000023FF;
-    R[0x2C0/4] = 0x01010101;
-    R[0x2C4/4] = 0x01010101;
-    R[0x2C8/4] = 0x00000001;
-    R[0x2D0/4] = 0x000F1F1F;
-    R[0x2D4/4] = 0x00470029;
-    R[0x2D8/4] = 0x0000003F;
-
-    /* Buffer enable flags */
-    R[0x2F0/4] = 0x80000000;
-    R[0x300/4] = 0x80000000;
-    R[0x310/4] = 0x80000000;
-    R[0x320/4] = 0x80000000;
-
-    /* Enable mode */
-    R[0x034/4] = 0x05;
+    /* DRC k-L curve table: direct 1:1 copy, register offset 0x690 + i*4 = table[i] */
+    for (size_t i = 0; i < 129; i++) {
+        R[(0x690 + i * 4) / 4] = ISP_DRC_KLCURVE_TABLE[i];
+    }
 }
 
 /**
- * Step 5: Start ISP processing.
- * From decompiled `isp_startup_Isp_PkgEnable`:
- *   Writing to register 0x100 triggers ISP to start processing MIPI frames.
- *   Must be done LAST after all other registers are configured.
- *
- * NOTE: After this, the ISP will generate interrupts.
- * The ioctl 0x690A (isp_start) should be called AFTER this
- * so the kernel interrupt handler finds properly configured registers.
+ * Single confirmed bit-set from `isp_module_bypass` (register 0x2c, bit
+ * 0x400). The vendor function only performs this when its caller-supplied
+ * parameter is 0; that parameter's real value isn't resolvable from this
+ * file alone, so this assumes the common/default (0) path. See file header.
+ */
+static void isp_apply_module_bypass(isp_ctx_t *ctx)
+{
+    volatile uint32_t *R = ctx->regs;
+    R[0x02c/4] = R[0x02c/4] | 0x400;
+}
+
+/**
+ * ISP processing enable. Confirmed byte-exact from
+ * `isp_startup_Isp_PkgEnable`.
  */
 static void isp_pkg_enable(isp_ctx_t *ctx)
 {
     volatile uint32_t *R = ctx->regs;
-    R[0x100/4] = 4;              /* set mode */
-    R[0x034/4] = 5;              /* enable processing */
-    R[0x100/4] = R[0x100/4] | 1; /* START */
+    R[0x100/4] = 4;
+    R[0x034/4] = 5;
+    R[0x100/4] = R[0x100/4] | 1;
 }
 
 /**
@@ -284,16 +462,18 @@ int isp_hw_init(isp_ctx_t *ctx, uint32_t width, uint32_t height)
 {
     if (isp_mmap(ctx, width, height) < 0) return -1;
 
-    /* Verify ISP chip ID */
+    /* Verify ISP chip ID. Not vendor behavior — isp_core_init itself does
+       no such check — this is our own extra safety probe before any write. */
     if (ctx->regs[0] != 0x5A542093) {
         fprintf(stderr, "ISP chip ID mismatch: 0x%08X\n", ctx->regs[0]);
         return -1;
     }
 
     isp_reset(ctx);
+    isp_ispp_init(ctx);
+    isp_ispf_init(ctx);
     isp_set_pic_size(ctx);
-    isp_enable_modules(ctx);
-    isp_init_filters(ctx);
+    isp_apply_module_bypass(ctx);
     /* Do NOT call isp_pkg_enable yet — wait for caller to do ioctl 0x690A first */
 
     return 0;

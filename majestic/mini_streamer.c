@@ -18,15 +18,26 @@
  *     and kernel modules, not guessed. See
  *     sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md.
  *
- *   STILL GENUINELY BLOCKED: the ISP register-table bring-up
- *     (isp_core_system_reset / common_init / isp_startup / isp_module_bypass
- *     in the vendor binary) pokes ~100+ registers directly via /dev/mem.
- *     This is the same unresolved crash risk (memory-attribute mismatch or
- *     IRQ race with isp.ko, never settled) the project was stuck on before
- *     this session. sdk/lib/isp_init.c's isp_hw_init()/isp_start_processing()
- *     is the existing clean-room attempt at this — called here, but this is
- *     the one part of the pipeline that may still crash the kernel. If it
- *     does, that's this section, not the VPSS/VMM/buffer-address work above.
+ *   REGISTER VALUES CONFIRMED, ACCESS SAFETY STILL GENUINELY BLOCKED: the
+ *     ISP register-table bring-up (sdk/lib/isp_init.c's isp_ispp_init/
+ *     isp_ispf_init/isp_pkg_enable/isp_reset). As of 2026-10-17 every
+ *     register offset and value these write is byte-exact from decompiling
+ *     isp_startup_Ispp_Init/Ispf_Init/Isp_PkgEnable/isp_core_system_reset
+ *     — no longer "derived from theory." The call order was also corrected
+ *     to match the real isp_core_init (buffer-address allocation before
+ *     this register table, not after — see isp_setup()'s own comment).
+ *     What byte-exact values do NOT resolve: whether writing these
+ *     registers via /dev/mem while isp.ko is loaded is safe at all — the
+ *     memory-attribute-mismatch/IRQ-race risk documented in
+ *     ISP_BUF_ADDR_PROTOCOL_V201.md, never settled before this session
+ *     either. Getting the VALUES right reduces the chance a wrong value
+ *     causes a hang or corrupted image; it does not touch that separate,
+ *     still-untested access-safety question. If the device hangs or
+ *     crashes here, that's still this section, not the VPSS/VMM/
+ *     buffer-address work before it. One part of this step remains
+ *     unconfirmed on its own terms: isp_set_pic_size (picture size/crop/
+ *     stride registers) — its vendor helper functions weren't decompiled
+ *     this round, so those specific values are still theory-derived.
  *
  *   CONFIRMED VIA DECOMPILE, NOT HARDWARE-TESTED: VENC (encoder) setup and
  *     the stream-get loop. Every ioctl code and struct layout below was read
@@ -262,10 +273,19 @@ static int mipi_setup(int isp_fd)
  * isp_core_init's exact decompiled order — those two don't fully agree
  * (test_minimal_regs.c's sequence is what's actually been run on hardware
  * without crashing; isp_core_init's is what the vendor binary does). After
- * 0x690A: isp_mmap + the register-table bring-up (isp_hw_init,
- * STILL UNRESOLVED — see file header), then isp_core_alloc_buf_addr
- * (this session's work, matches isp_core_init's real order: buffer-address
- * wiring before isp_module_bypass), then isp_start_processing (PkgEnable).
+ * 0x690A: isp_core_alloc_buf_addr (purely ioctl-mediated, no /dev/mem),
+ * then isp_mmap + the register-table bring-up (isp_hw_init, STILL
+ * UNRESOLVED — see file header), then isp_start_processing (PkgEnable).
+ *
+ * ORDER FIX (2026-10-17): previously isp_hw_init() (register writes) ran
+ * BEFORE isp_core_alloc_buf_addr(). Decompiling isp_core_init's real
+ * top-level sequence this session showed the opposite — buffer-address
+ * allocation (`FUN_002da83c`, i.e. isp_core_alloc_buf_addr) runs before
+ * isp_core_system_reset and the rest of the register-table bring-up, not
+ * after. Swapped to match. This doesn't change isp_core_alloc_buf_addr's
+ * own risk profile (still only ioctls, never /dev/mem) — it changes
+ * which step happens first relative to the genuinely unresolved
+ * register-table writes.
  */
 static int isp_setup(isp_ctx_t *isp_ctx, int isp_fd, int vmm_fd, uint32_t width, uint32_t height)
 {
@@ -287,6 +307,12 @@ static int isp_setup(isp_ctx_t *isp_ctx, int isp_fd, int vmm_fd, uint32_t width,
 
     if (ioctl(isp_fd, 0x4004690F, &one) < 0) return -1;
 
+    isp_core_set_fds(isp_fd, vmm_fd);
+    if (isp_core_alloc_buf_addr(width, height) != 0) {
+        fprintf(stderr, "isp_core_alloc_buf_addr failed\n");
+        return -1;
+    }
+
     fprintf(stderr,
             "WARNING: about to write the ISP register table via /dev/mem.\n"
             "This is the part that was never settled before this session —\n"
@@ -294,12 +320,6 @@ static int isp_setup(isp_ctx_t *isp_ctx, int isp_fd, int vmm_fd, uint32_t width,
             "step, not the VPSS/VMM/buffer-address work before it.\n");
     if (isp_hw_init(isp_ctx, width, height) < 0) {
         fprintf(stderr, "isp_hw_init failed (chip ID mismatch or mmap failure)\n");
-        return -1;
-    }
-
-    isp_core_set_fds(isp_fd, vmm_fd);
-    if (isp_core_alloc_buf_addr(width, height) != 0) {
-        fprintf(stderr, "isp_core_alloc_buf_addr failed\n");
         return -1;
     }
 
