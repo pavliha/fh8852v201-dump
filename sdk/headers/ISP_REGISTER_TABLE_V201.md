@@ -34,8 +34,7 @@ isp_startup_Ispp_Init()         // register table, part 1 — see below
 isp_startup_Ispf_Init()         // register table, part 2 — see below
 isp_startup_Chip_Adapt_Init()   // confirmed no-op
 [optional sensor vtable hook]   // not statically resolvable; not exercised by this project
-isp_startup_IspInPicCfg()       // resolution-dependent helpers (SetInputPicSize etc.) — NOT
-                                 // decompiled this round; isp_set_pic_size() stays theory-derived
+isp_startup_IspInPicCfg()       // mostly confirmed (2026-10-18 addendum) — see below
 sensorDp_setAttribute2Isp()     // confirmed resolved (2026-10-17 addendum) — see below
 isp_startup_Isp_PkgEnable()     // register table, part 3 — see below
 ```
@@ -98,6 +97,30 @@ underlying data — reading the raw bytes of the global it dispatches through (`
   from the returned value (`(reg & 0xFFFFFFF2) | (value << 2)`).
 - `lf_yoffset()`: confirmed no-op (`return;`, 4 bytes — same pattern as `isp_startup_pkg_init`/
   `Isp_SetMode`/`Chip_Adapt_Init`).
+
+**`isp_startup_IspInPicCfg`** (2026-10-18 addendum — mostly confirmed, two helpers still open):
+its own direct sub-calls, decompiled individually:
+
+- `SetInputPicSize(ctx, w, h)`: registers `0x130`/`0x144` = `(w-1) | (h-1)<<16`.
+- `SetIspPicSize(ctx, w, h)`: a dozen registers (`0x138`, `0x14c`, `0x490`, `0xd0`, `0x500`,
+  `0x504`, `0x508`, `0x4e0`, `0x4e4`, `0x4e8`, `0x2e8`, `0x2f0`, `0x2f8`, `0x300`, `0x308`,
+  `0x310`, `0x318`, `0x320`, `0x41c`, `0xaa8`, `0x648`, `0x658`) derived from block counts
+  (`w>>5`, `h>>5`) and raw/quarter-res DMA strides — see `isp_set_pic_size()` for the exact
+  formulas, now copied verbatim from the decompile rather than independently re-derived.
+- `SetIspPicCut(ctx, x, y)`: registers `0x134`/`0x148` = `x | y<<16`. Called with `(0, 0)` —
+  full frame, no crop — since this file's `ctx` has no equivalent for the crop x/y fields the
+  real `IspInPicCfg` reads from `isp_core`.
+- `SetNr3dTab()` and `SetDehazeTab()`: confirmed no-ops.
+- `SetCnrExpTab(ctx)`: a 56-word table (`nr3d_exp_tab`, read via `read_bytes`) copied 1:1 into
+  registers `0xb4c` through `0xc28`.
+
+**Still open**: `SetLscTab` and `SetNr3dDrcWin`. Both route through
+`isp_common_set_stat_param`/`isp_common_set_stat_win_param` — a real iterative search algorithm
+(modulo arithmetic, a loop refining a window-size estimate, an `easylog2` call) computing
+statistics-window geometry, not a fixed value or a direct table copy. Decompiled but not yet
+ported to C; porting an algorithm carries more transcription risk than copying literal values; a
+mistake here would be wrong behavior, not a crash, so it's lower urgency than the register-table
+work but still not done.
 
 Neither of these is a dead end anymore. `vi_pol`'s register write is gated on a sensor-specific
 callback this project's `sdk/lib/cv2003_driver.c` doesn't implement, so it correctly stays inert

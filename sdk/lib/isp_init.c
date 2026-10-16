@@ -106,11 +106,39 @@ static void isp_reset(isp_ctx_t *ctx)
     usleep(1000); /* 1ms settle — our own addition, not in the vendor function */
 }
 
+/*
+ * CNR exposure table copied into registers 0xb4c.. by the real
+ * isp_startup_IspInPicCfg -> SetCnrExpTab (read via read_bytes at ipcam's
+ * nr3d_exp_tab, 56 words / 224 bytes, 2026-10-18).
+ */
+static const uint32_t ISP_CNR_EXP_TABLE[56] = {
+    0x03c103ff, 0x03500387, 0x02ed031d, 0x029502bf, 0x0247026d, 0x02020224, 0x01c601e3, 0x019101aa,
+    0x01610178, 0x0138014c, 0x01130125, 0x00f30102, 0x00d600e4, 0x00bd00c9, 0x00a700b1, 0x0093009d,
+    0x0082008a, 0x0072007a, 0x0065006b, 0x0059005f, 0x004e0054, 0x0045004a, 0x003d0041, 0x00360039,
+    0x002f0032, 0x002a002c, 0x00250027, 0x00200023, 0x001d001e, 0x0019001b, 0x00160018, 0x00130015,
+    0x00110012, 0x000f0010, 0x000d000e, 0x000c000c, 0x000a000b, 0x0009000a, 0x00080008, 0x00070007,
+    0x00060006, 0x00050006, 0x00050005, 0x00040004, 0x00030004, 0x00030003, 0x00030003, 0x00020002,
+    0x00020002, 0x00020002, 0x00010001, 0x00010001, 0x00010001, 0x00010001, 0x00010001, 0x00000001,
+};
+
 /**
- * Step 2 (derived, NOT confirmed): picture size / crop / stride / stat-window
- * registers. See file header — isp_startup_IspInPicCfg's own helper functions
- * were not decompiled this revision, so these values are still computed from
- * resolution and documented register semantics, not vendor-exact.
+ * Picture size / crop / stride / stat-window registers.
+ *
+ * CONFIRMED (2026-10-18) from decompiling isp_startup_IspInPicCfg's real
+ * helpers: SetInputPicSize (0x130/0x144), SetIspPicSize (0x138/0x14c/0x490/
+ * 0xd0/0x500/0x504/0x508/0x4e0/0x4e4/0x4e8/0x2e8/0x2f0/0x2f8/0x300/0x308/
+ * 0x310/0x318/0x320/0x41c/0xaa8/0x648/0x658), SetIspPicCut (0x134/0x148),
+ * and SetCnrExpTab (the table above, offsets 0xb4c-0xc28). SetNr3dTab and
+ * SetDehazeTab are confirmed no-ops — nothing to call for them.
+ *
+ * STILL NOT DECOMPILED: SetLscTab and SetNr3dDrcWin. Both route through
+ * isp_common_set_stat_param/isp_common_set_stat_win_param, an iterative
+ * search algorithm (not a fixed formula) computing statistics-window
+ * geometry — a real algorithm to port, not a value table, and not done
+ * yet. No crop offset equivalent exists in this file's ctx either (the
+ * real IspInPicCfg takes crop x/y from isp_core fields this file has no
+ * equivalent for); SetIspPicCut is called with (0,0), full-frame, which
+ * is what the pre-existing code already assumed.
  */
 static void isp_set_pic_size(isp_ctx_t *ctx)
 {
@@ -118,41 +146,50 @@ static void isp_set_pic_size(isp_ctx_t *ctx)
     uint32_t w = ctx->width;
     uint32_t h = ctx->height;
 
-    uint32_t full_size = (w - 1) | ((h - 1) << 16);
+    /* SetInputPicSize(ctx, w, h) */
+    uint32_t input_size = (w - 1) | ((h - 1) << 16);
+    R[0x130/4] = input_size;
+    R[0x144/4] = input_size;
 
-    R[0x130/4] = full_size;
-    R[0x144/4] = full_size;
-    R[0x138/4] = full_size;
-    R[0x0D0/4] = full_size;
-
-    R[0x134/4] = 0;
-    R[0x148/4] = 0;
-
-    uint32_t sub_w = w / 3;
-    uint32_t sub_h = h * 4 / 9;
-    R[0x14C/4] = (sub_w - 1) | ((sub_h - 1) << 16);
-
-    uint32_t raw_stride = (((w * 10 + 7) / 8) + 7) & ~7;
-    uint32_t q_stride = ((((w / 4) * 10) / 8) + 7) & ~7;
-
-    R[0x2E8/4] = raw_stride;
-    R[0x2F0/4] = raw_stride | 0x80000000;
-    R[0x308/4] = q_stride;
-    R[0x310/4] = q_stride | 0x80000000;
-    R[0x318/4] = q_stride;
-    R[0x320/4] = q_stride | 0x80000000;
-
-    uint32_t blk_w = (w / 32) - 1;
-    uint32_t blk_h = (h / 32) - 1;
-    R[0x490/4] = (blk_h << 24) | ((w / 48 - 1) << 16);
-
-    R[0x4E0/4] = (blk_w | (blk_h << 8)) | 0x0F0F0000;
-    R[0x4E4/4] = 0;
-    R[0x4E8/4] = 0x1FFF1;
-
+    /* SetIspPicSize(ctx, w, h) */
+    uint32_t blk_h = (h >> 5) - 1;
+    uint32_t blk_w = (w >> 5) - 1;
+    uint32_t isp_size = (w - 1) | ((h - 1) << 16);
+    R[0x138/4] = isp_size;
+    R[0x14c/4] = isp_size;
+    R[0x490/4] = (blk_h << 24) | ((w / 0x30 - 1) << 16);
+    R[0x0d0/4] = isp_size;
     R[0x500/4] = 0;
     R[0x504/4] = 0;
     R[0x508/4] = blk_w | (blk_h << 16) | 0x78007800;
+
+    uint32_t raw_stride = ((w * 10 + 7) >> 3) + 7;
+    R[0x4e0/4] = ((blk_w | (blk_h << 8)) & 0x1fffffff) | (R[0x4e0/4] & 0xe0000000) | 0xf0f0000;
+    uint32_t q_stride = (((w >> 2) * 10) >> 3) + 7;
+    R[0x4e4/4] = 0;
+    R[0x4e8/4] = 0x1fff1;
+    R[0x2e8/4] = raw_stride & 0xfffffff8;
+    uint32_t q_stride_en = (q_stride & 0x7ffffff8) | 0x80000000;
+    R[0x2f0/4] = (raw_stride & 0x7ffffff8) | 0x80000000;
+    R[0x2f8/4] = 0x280;
+    R[0x300/4] = 0x80000280;
+    R[0x308/4] = q_stride & 0xfffffff8;
+    R[0x310/4] = q_stride_en;
+    R[0x318/4] = q_stride & 0xfffffff8;
+    R[0x320/4] = q_stride_en;
+    R[0x41c/4] = q_stride & 0xfff8;
+    R[0xaa8/4] = q_stride & 0xfff8;
+    R[0x648/4] = 0x80000348;
+    R[0x658/4] = 0x80000348;
+
+    /* SetIspPicCut(ctx, 0, 0) — full frame, no crop */
+    R[0x134/4] = 0;
+    R[0x148/4] = 0;
+
+    /* SetCnrExpTab(ctx): direct 1:1 copy, register offset 0xb4c + i*4 = table[i] */
+    for (size_t i = 0; i < 56; i++) {
+        R[(0xb4c + i * 4) / 4] = ISP_CNR_EXP_TABLE[i];
+    }
 }
 
 /*
