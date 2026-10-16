@@ -13,11 +13,14 @@ typedef struct {
     int rtp_fd;
     int rtcp_fd;
     struct sockaddr_in rtp_addr;
+    struct sockaddr_in rtcp_addr;
     uint32_t session_id;
     uint16_t seq;
     uint32_t ssrc;
     int playing;
     int stream_id;
+    uint32_t pkt_count;
+    uint32_t octet_count;
     char rxbuf[2048];
     size_t rxlen;
 } rtsp_client_t;
@@ -41,6 +44,7 @@ void rtsp_server_poll(rtsp_server_t *srv);
 void rtsp_server_set_param_set(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len);
 void rtsp_server_send_nal(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len,
                            uint32_t rtp_ts, int is_last_in_frame);
+void rtsp_server_send_rtcp_sr(rtsp_server_t *srv, int stream_id, uint32_t rtp_ts);
 void rtsp_server_close(rtsp_server_t *srv);
 
 #endif

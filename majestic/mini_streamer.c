@@ -644,6 +644,7 @@ int main(void)
 
     uint32_t frame_count = 0;
     uint32_t rtp_ts[VPSS_CHANNEL_COUNT] = {0};
+    uint32_t chan_frame_count[VPSS_CHANNEL_COUNT] = {0};
     while (g_running) {
         rtsp_server_poll(&rtsp);
 
@@ -659,8 +660,15 @@ int main(void)
             int pack_count = venc_get_stream(enc_fd, isp_ctx.mem_fd, chan, &rtsp, rtp_ts[i]);
             if (pack_count <= 0)
                 continue;
-            rtp_ts[i] += 3600; /* 90000 Hz RTP clock / 25 fps */
             any_frame = 1;
+
+            /* RTCP SR once per second (~25 frames @ 25fps) per RFC 3550 6.4.1 */
+            chan_frame_count[i]++;
+            if (chan_frame_count[i] % 25 == 0) {
+                rtsp_server_send_rtcp_sr(&rtsp, (int)chan, rtp_ts[i]);
+            }
+
+            rtp_ts[i] += 3600; /* 90000 Hz RTP clock / 25 fps */
 
             if (chan == 0) {
                 frame_count++;

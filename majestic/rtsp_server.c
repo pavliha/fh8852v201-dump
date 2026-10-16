@@ -10,8 +10,11 @@
  *
  * Scope: two video streams (stream1 = main, stream2 = sub), H.264 only,
  * UDP transport, up to RTSP_MAX_CLIENTS simultaneous viewers, optional
- * RTSP Basic auth. No RTCP feedback, no TCP-interleaved mode, no audio
- * track. OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN/GET_PARAMETER only.
+ * RTSP Basic auth, RTCP Sender Reports (send-only, once/sec per client —
+ * see rtsp_server_send_rtcp_sr(), RFC 3550 6.4.1). No RTCP feedback
+ * parsing (nothing reads the client's own RTCP packets), no
+ * TCP-interleaved mode, no audio track. OPTIONS/DESCRIBE/SETUP/PLAY/
+ * TEARDOWN/GET_PARAMETER only.
  */
 
 #include <stdio.h>
@@ -21,6 +24,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <arpa/inet.h>
 
 #include "rtsp_server.h"
@@ -278,6 +282,8 @@ static void rtsp_handle_request(rtsp_server_t *srv, rtsp_client_t *c, const char
             getpeername(c->tcp_fd, (struct sockaddr *)&peer, &plen);
             c->rtp_addr = peer;
             c->rtp_addr.sin_port = htons((uint16_t)cport1);
+            c->rtcp_addr = peer;
+            c->rtcp_addr.sin_port = htons((uint16_t)(cport2 > 0 ? cport2 : cport1 + 1));
 
             c->rtp_fd = socket(AF_INET, SOCK_DGRAM, 0);
             c->rtcp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -399,7 +405,60 @@ static void rtp_send_packet(rtsp_client_t *c, const uint8_t *payload, size_t len
     pkt[11] = (uint8_t)c->ssrc;
     memcpy(pkt + 12, payload, len);
     c->seq++;
+    c->pkt_count++;
+    c->octet_count += (uint32_t)len;
     sendto(c->rtp_fd, pkt, 12 + len, 0, (struct sockaddr *)&c->rtp_addr, sizeof(c->rtp_addr));
+}
+
+/*
+ * RTCP Sender Report (RFC 3550 6.4.1). No RTCP feedback is parsed back
+ * from clients — this is send-only, enough for ffplay/VLC to show sync
+ * and bitrate stats, which is what RTCP is for in a one-way media stream.
+ */
+void rtsp_server_send_rtcp_sr(rtsp_server_t *srv, int stream_id, uint32_t rtp_ts)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    uint32_t ntp_sec = (uint32_t)tv.tv_sec + 2208988800u; /* Unix epoch -> NTP epoch */
+    uint32_t ntp_frac = (uint32_t)((double)tv.tv_usec * 4294967296.0 / 1000000.0);
+
+    for (int i = 0; i < RTSP_MAX_CLIENTS; i++) {
+        rtsp_client_t *c = &srv->clients[i];
+        if (c->tcp_fd < 0 || !c->playing || c->rtcp_fd < 0 || c->stream_id != stream_id) continue;
+
+        uint8_t pkt[28];
+        pkt[0] = 0x80;
+        pkt[1] = 200; /* SR */
+        pkt[2] = 0;
+        pkt[3] = 6; /* (28/4)-1 */
+        pkt[4] = (uint8_t)(c->ssrc >> 24);
+        pkt[5] = (uint8_t)(c->ssrc >> 16);
+        pkt[6] = (uint8_t)(c->ssrc >> 8);
+        pkt[7] = (uint8_t)c->ssrc;
+        pkt[8] = (uint8_t)(ntp_sec >> 24);
+        pkt[9] = (uint8_t)(ntp_sec >> 16);
+        pkt[10] = (uint8_t)(ntp_sec >> 8);
+        pkt[11] = (uint8_t)ntp_sec;
+        pkt[12] = (uint8_t)(ntp_frac >> 24);
+        pkt[13] = (uint8_t)(ntp_frac >> 16);
+        pkt[14] = (uint8_t)(ntp_frac >> 8);
+        pkt[15] = (uint8_t)ntp_frac;
+        pkt[16] = (uint8_t)(rtp_ts >> 24);
+        pkt[17] = (uint8_t)(rtp_ts >> 16);
+        pkt[18] = (uint8_t)(rtp_ts >> 8);
+        pkt[19] = (uint8_t)rtp_ts;
+        pkt[20] = (uint8_t)(c->pkt_count >> 24);
+        pkt[21] = (uint8_t)(c->pkt_count >> 16);
+        pkt[22] = (uint8_t)(c->pkt_count >> 8);
+        pkt[23] = (uint8_t)c->pkt_count;
+        pkt[24] = (uint8_t)(c->octet_count >> 24);
+        pkt[25] = (uint8_t)(c->octet_count >> 16);
+        pkt[26] = (uint8_t)(c->octet_count >> 8);
+        pkt[27] = (uint8_t)c->octet_count;
+
+        sendto(c->rtcp_fd, pkt, sizeof(pkt), 0,
+               (struct sockaddr *)&c->rtcp_addr, sizeof(c->rtcp_addr));
+    }
 }
 
 void rtsp_server_send_nal(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len,
