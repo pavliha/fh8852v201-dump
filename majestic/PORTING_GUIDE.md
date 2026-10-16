@@ -39,9 +39,11 @@ A. **Contact Fullhan** — Request SDK libraries for FH8852V201. Phone: 021-6112
    The Tuya IoTOS SDK includes Fullhan toolchain and may include SDK `.so` files:
    https://github.com/tuya/tuya-iotos-embeded-sdk-multimedia
 
-B. **Use kernel module ioctl directly** — The `.ko` modules ARE the vendor SDK.
-   Majestic could call ioctl() directly on `/dev/media_process` instead of through
-   wrapper libraries. All ioctl codes are documented in our SDK headers:
+B. **Use kernel module ioctl directly** — The `.ko` modules ARE the vendor SDK. This is
+   the path `majestic/mini_streamer.c` actually takes: no wrapper libraries, ioctls
+   straight on the device nodes. VPSS and ISP ioctls go on `/dev/isp`'s fd; VENC ioctls
+   go on `/dev/enc`'s fd (confirmed by decompile — these are two separate device nodes
+   with separate fds, not one shared `/dev/media_process` handle):
    - `0xC0F4696A` — VPSS set VI attributes
    - `0xC0046971` — VPSS enable
    - `0xC00C696C` — VPSS set channel attributes
@@ -49,9 +51,17 @@ B. **Use kernel module ioctl directly** — The `.ko` modules ARE the vendor SDK
    - `0xC00869A4` — VPSS set VO mode
    - `0xC0086978` — VPSS set frame control
    - `0xC0686970` — VPSS get frame
-   - `0xC1A04D05` — VENC get stream
-   - `0xC01C5403` — VENC create channel
-   - `0xC06C540C` — VENC set rate control
+   - `0xc0085401` / `0xc00c5400` — VENC shared memory pool get-size/set-addr
+   - `0xc0145402` — VENC query per-channel memory size
+   - `0xC01C5403` — VENC create channel (28-byte struct, fully confirmed)
+   - `0xC06C540C` — VENC set rate control (104-byte struct, fully confirmed for RC mode 9)
+   - `0xC0045407` — VENC start recv pic (no struct argument)
+   - `0xC1A04D05` — VENC get stream (pack-array response struct, fully confirmed)
+   - `0xC004540A` — VENC release stream
+
+   All VENC codes and struct layouts above were decompiled, not guessed — full derivation
+   in `../sdk/headers/VENC_PROTOCOL_V201.md`. The ISP DMA buffer-address wiring these VPSS
+   ioctls depend on is in `../sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md`.
 
 C. **Extract from Tuya/other SDK** — If another Fullhan SDK package has the `.so`
    files built for FH8852V200, they should work for V201 (same API).
