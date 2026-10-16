@@ -27,12 +27,22 @@ and kernel modules, not guessed:
   `sdk/headers/VENC_PROTOCOL_V201.md`). This replaces the project's earlier best-effort VENC
   guesses — including discovering the real dispatch architecture (a per-channel vtable inside
   `ipcam`, not direct ioctls) and that VENC's ioctls go on `/dev/enc`'s fd, not `/dev/isp`'s.
+- **Dual-stream VPSS/VENC** — a second channel (800x576 substream, alongside the 1920x1080 main
+  stream) generalizes the single-channel VPSS/VENC bring-up across channel indices. Confirmed
+  safe from decompile, not guessed: `FH_VPSS_ChnInitMem`/`SetChnAttr`/`SetVOMode` are all
+  channel-indexed (checked `< 5` channels in the vendor binary), and `FH_VPSS_SysInitMem`'s own
+  real init loops per-channel memory setup over every channel with nonzero capability —
+  `vpss_setup()` now follows that same structure instead of being hand-extended on faith.
 
-`majestic/mini_streamer.c` now wires the whole pipeline together — device opens, MIPI, VPSS,
-sensor I2C, buffer-address protocol, and the confirmed VENC layer — and builds clean. One part
-is still a genuine open risk: the ISP register-table bring-up (~100+ raw `/dev/mem` writes) that
-was never resolved before this session either. The file's own header comments mark exactly which
-sections are hardware-proven, which are newly-derived-but-untested, and which are still blocked,
+`majestic/mini_streamer.c` now wires the whole pipeline together — device opens, MIPI, VPSS
+(two channels), sensor I2C, buffer-address protocol, and the confirmed VENC layer (two channels)
+— plus a from-spec RTSP/RTP server (`majestic/rtsp_server.c`, RFC 2326 + RFC 6184, not decompiled
+from anything — there's no vendor RTSP logic to clean-room here) serving both streams live at
+`rtsp://<device-ip>:554/stream1` and `.../stream2`, with optional Basic auth. All of it builds
+clean. One part is still a genuine open risk: the ISP register-table bring-up (~100+ raw
+`/dev/mem` writes) that was never resolved before this session either. The file's own header
+comments mark exactly which sections are hardware-proven, which are newly-derived-but-untested,
+and which are still blocked,
 so a crash can be attributed to the right layer. Next step is running it on real hardware.
 
 ## Repository Structure

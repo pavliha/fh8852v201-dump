@@ -1,5 +1,5 @@
 /**
- * Minimal single-purpose RTSP/RTP server for mini_streamer.c.
+ * Minimal RTSP/RTP server for mini_streamer.c.
  *
  * Implemented directly from RFC 2326 (RTSP) and RFC 6184 (H.264 over RTP) —
  * public IETF specs, not decompiled from any vendor binary. There is no
@@ -8,10 +8,10 @@
  * deliberately not consulted for protocol logic (see README's decompiled-
  * function tables for their existence, not their implementation).
  *
- * Scope: one video stream, H.264 only, UDP transport, up to
- * RTSP_MAX_CLIENTS simultaneous viewers. No auth, no RTCP feedback, no
- * TCP-interleaved mode, no audio track. OPTIONS/DESCRIBE/SETUP/PLAY/
- * TEARDOWN/GET_PARAMETER only.
+ * Scope: two video streams (stream1 = main, stream2 = sub), H.264 only,
+ * UDP transport, up to RTSP_MAX_CLIENTS simultaneous viewers, optional
+ * RTSP Basic auth. No RTCP feedback, no TCP-interleaved mode, no audio
+ * track. OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN/GET_PARAMETER only.
  */
 
 #include <stdio.h>
@@ -56,6 +56,40 @@ static size_t base64_encode(const uint8_t *in, size_t in_len, char *out, size_t 
     return oi;
 }
 
+static int b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static size_t base64_decode(const char *in, char *out, size_t out_cap)
+{
+    size_t oi = 0;
+    int vals[4];
+    int n = 0;
+    for (const char *p = in; *p && *p != '='; p++) {
+        int v = b64_val(*p);
+        if (v < 0) continue;
+        vals[n++] = v;
+        if (n == 4) {
+            if (oi + 3 < out_cap) {
+                out[oi++] = (char)((vals[0] << 2) | (vals[1] >> 4));
+                out[oi++] = (char)((vals[1] << 4) | (vals[2] >> 2));
+                out[oi++] = (char)((vals[2] << 6) | vals[3]);
+            }
+            n = 0;
+        }
+    }
+    if (n >= 2 && oi + 1 < out_cap) out[oi++] = (char)((vals[0] << 2) | (vals[1] >> 4));
+    if (n >= 3 && oi + 1 < out_cap) out[oi++] = (char)((vals[1] << 4) | (vals[2] >> 2));
+    out[oi] = '\0';
+    return oi;
+}
+
 /* Exact-case match on the canonical RTSP header spelling ffplay/VLC send.
    RTSP headers are formally case-insensitive; this is a scoped-down
    simplification, not a protocol-complete parser. */
@@ -75,6 +109,30 @@ static int header_value(const char *req, const char *name, char *out, size_t out
         p++;
     }
     return 0;
+}
+
+/* Which stream a request's URI refers to: anything mentioning "stream2"
+   is the sub stream (index 1), everything else defaults to stream1. */
+static int parse_stream_id(const char *req)
+{
+    char uri[256] = {0};
+    sscanf(req, "%*s %255s", uri);
+    return strstr(uri, "stream2") != NULL ? 1 : 0;
+}
+
+static int check_auth(rtsp_server_t *srv, const char *req)
+{
+    if (!srv->auth_enabled) return 1;
+    char auth[256] = {0};
+    if (!header_value(req, "Authorization", auth, sizeof(auth))) return 0;
+    char *b64 = strstr(auth, "Basic ");
+    if (!b64) return 0;
+    b64 += strlen("Basic ");
+    char decoded[128] = {0};
+    base64_decode(b64, decoded, sizeof(decoded));
+    char expected[64];
+    snprintf(expected, sizeof(expected), "%s:%s", srv->auth_user, srv->auth_pass);
+    return strcmp(decoded, expected) == 0;
 }
 
 static void rtsp_client_reset(rtsp_client_t *c)
@@ -122,6 +180,13 @@ int rtsp_server_init(rtsp_server_t *srv, uint16_t port)
     return 0;
 }
 
+void rtsp_server_set_credentials(rtsp_server_t *srv, const char *user, const char *pass)
+{
+    srv->auth_enabled = 1;
+    strncpy(srv->auth_user, user, sizeof(srv->auth_user) - 1);
+    strncpy(srv->auth_pass, pass, sizeof(srv->auth_pass) - 1);
+}
+
 static void rtsp_accept_new(rtsp_server_t *srv)
 {
     int fd = accept(srv->listen_fd, NULL, NULL);
@@ -155,15 +220,26 @@ static void rtsp_handle_request(rtsp_server_t *srv, rtsp_client_t *c, const char
     char resp[1024];
     int resp_len;
 
+    int needs_auth = (strcmp(method, "DESCRIBE") == 0 || strcmp(method, "SETUP") == 0 ||
+                       strcmp(method, "PLAY") == 0);
+    if (needs_auth && !check_auth(srv, req)) {
+        resp_len = snprintf(resp, sizeof(resp),
+            "RTSP/1.0 401 Unauthorized\r\nCSeq: %s\r\n"
+            "WWW-Authenticate: Basic realm=\"mini_streamer\"\r\n\r\n", cseq);
+        send(c->tcp_fd, resp, (size_t)resp_len, 0);
+        return;
+    }
+
     if (strcmp(method, "OPTIONS") == 0) {
         resp_len = snprintf(resp, sizeof(resp),
             "RTSP/1.0 200 OK\r\nCSeq: %s\r\n"
             "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n",
             cseq);
     } else if (strcmp(method, "DESCRIBE") == 0) {
+        int sid = parse_stream_id(req);
         char sps_b64[128] = {0}, pps_b64[128] = {0};
-        base64_encode(srv->sps, srv->sps_len, sps_b64, sizeof(sps_b64));
-        base64_encode(srv->pps, srv->pps_len, pps_b64, sizeof(pps_b64));
+        base64_encode(srv->sps[sid], srv->sps_len[sid], sps_b64, sizeof(sps_b64));
+        base64_encode(srv->pps[sid], srv->pps_len[sid], pps_b64, sizeof(pps_b64));
         char sdp[768];
         int sdp_len = snprintf(sdp, sizeof(sdp),
             "v=0\r\n"
@@ -176,16 +252,16 @@ static void rtsp_handle_request(rtsp_server_t *srv, rtsp_client_t *c, const char
             "a=rtpmap:96 H264/90000\r\n"
             "a=fmtp:96 packetization-mode=1;profile-level-id=%02x%02x%02x;"
             "sprop-parameter-sets=%s,%s\r\n"
-            "a=control:stream1\r\n",
-            srv->sps_len > 3 ? srv->sps[1] : 0,
-            srv->sps_len > 3 ? srv->sps[2] : 0,
-            srv->sps_len > 3 ? srv->sps[3] : 0,
-            sps_b64, pps_b64);
+            "a=control:stream%d\r\n",
+            srv->sps_len[sid] > 3 ? srv->sps[sid][1] : 0,
+            srv->sps_len[sid] > 3 ? srv->sps[sid][2] : 0,
+            srv->sps_len[sid] > 3 ? srv->sps[sid][3] : 0,
+            sps_b64, pps_b64, sid + 1);
         resp_len = snprintf(resp, sizeof(resp),
             "RTSP/1.0 200 OK\r\nCSeq: %s\r\n"
-            "Content-Base: rtsp://0.0.0.0:554/stream1/\r\n"
+            "Content-Base: rtsp://0.0.0.0:554/stream%d/\r\n"
             "Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s",
-            cseq, sdp_len, sdp);
+            cseq, sid + 1, sdp_len, sdp);
     } else if (strcmp(method, "SETUP") == 0) {
         char transport[256] = {0};
         header_value(req, "Transport", transport, sizeof(transport));
@@ -231,6 +307,7 @@ static void rtsp_handle_request(rtsp_server_t *srv, rtsp_client_t *c, const char
             c->seq = 0;
             c->ssrc = 0x4D494E49u + c->session_id; /* "MINI" + session id */
             c->playing = 0;
+            c->stream_id = parse_stream_id(req);
 
             resp_len = snprintf(resp, sizeof(resp),
                 "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: %u\r\n"
@@ -287,16 +364,16 @@ void rtsp_server_poll(rtsp_server_t *srv)
     }
 }
 
-void rtsp_server_set_param_set(rtsp_server_t *srv, const uint8_t *nal, size_t nal_len)
+void rtsp_server_set_param_set(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len)
 {
-    if (nal_len == 0) return;
+    if (nal_len == 0 || stream_id < 0 || stream_id >= RTSP_STREAM_COUNT) return;
     int type = nal[0] & 0x1F;
-    if (type == 7 && nal_len <= sizeof(srv->sps)) {
-        memcpy(srv->sps, nal, nal_len);
-        srv->sps_len = nal_len;
-    } else if (type == 8 && nal_len <= sizeof(srv->pps)) {
-        memcpy(srv->pps, nal, nal_len);
-        srv->pps_len = nal_len;
+    if (type == 7 && nal_len <= sizeof(srv->sps[stream_id])) {
+        memcpy(srv->sps[stream_id], nal, nal_len);
+        srv->sps_len[stream_id] = nal_len;
+    } else if (type == 8 && nal_len <= sizeof(srv->pps[stream_id])) {
+        memcpy(srv->pps[stream_id], nal, nal_len);
+        srv->pps_len[stream_id] = nal_len;
     }
 }
 
@@ -325,14 +402,14 @@ static void rtp_send_packet(rtsp_client_t *c, const uint8_t *payload, size_t len
     sendto(c->rtp_fd, pkt, 12 + len, 0, (struct sockaddr *)&c->rtp_addr, sizeof(c->rtp_addr));
 }
 
-void rtsp_server_send_nal(rtsp_server_t *srv, const uint8_t *nal, size_t nal_len,
+void rtsp_server_send_nal(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len,
                            uint32_t rtp_ts, int is_last_in_frame)
 {
     if (nal_len == 0) return;
 
     for (int i = 0; i < RTSP_MAX_CLIENTS; i++) {
         rtsp_client_t *c = &srv->clients[i];
-        if (c->tcp_fd < 0 || !c->playing || c->rtp_fd < 0) continue;
+        if (c->tcp_fd < 0 || !c->playing || c->rtp_fd < 0 || c->stream_id != stream_id) continue;
 
         if (nal_len <= RTP_MTU_PAYLOAD) {
             rtp_send_packet(c, nal, nal_len, rtp_ts, is_last_in_frame);

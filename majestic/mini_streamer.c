@@ -56,14 +56,24 @@
  *     directly from RFC 2326 and RFC 6184, deliberately without consulting
  *     majestic's or ipcam's own RTSP implementation — this is public
  *     protocol, not vendor logic, so there was nothing to clean-room here
- *     at all. Scope: one stream, H.264/UDP only, no auth. See
- *     rtsp_server.h for the exact method/feature list.
+ *     at all. Scope: two streams (main + sub), H.264/UDP only, optional
+ *     Basic auth. See rtsp_server.h for the exact method/feature list.
+ *
+ *   SECOND CHANNEL (stream2/sub, 800x576): confirmed safe to generalize
+ *     from decompile, not guessed — FH_VPSS_ChnInitMem/SetChnAttr/
+ *     SetVOMode are all channel-indexed (checked "< 5" channels) and
+ *     FH_VPSS_SysInitMem's own real init loops GET_CHN_SIZE/alloc/
+ *     SET_CHN_ADDR over every channel with nonzero capability, which is
+ *     the structure vpss_setup()/venc_chn_setup() follow. FH_VPSS_OpenChn
+ *     and FH_VPSS_Enable take no channel argument at all — called once,
+ *     not per channel, confirmed from decompile rather than assumed.
  *
  * Usage:
  *   echo V > /dev/watchdog   # magic close, disables watchdog
  *   killall ipcam
  *   ./mini_streamer
- *   # then: ffplay rtsp://<device-ip>:554/stream1
+ *   # then: ffplay rtsp://<device-ip>:554/stream1   (main, 1920x1080)
+ *   #       ffplay rtsp://<device-ip>:554/stream2   (sub, 800x576)
  */
 
 #include <stdio.h>
@@ -170,6 +180,29 @@ static void apply_proc_config(void)
         write_proc_config(cfg[i][0], cfg[i][1]);
 }
 
+/*
+ * Two channels: stream1 (main, 1920x1080) and stream2 (sub, 800x576 —
+ * matches apply_proc_config's "cap_1_800_576"). Per-channel step ordering
+ * and parameterization confirmed from FH_VPSS_SysInitMem/SetChnAttr/
+ * SetVOMode (all channel-indexed, checked "< 5") and FH_VPSS_OpenChn
+ * (no channel argument at all — called once, not per channel): the
+ * real vendor init loops GET_CHN_SIZE/alloc/SET_CHN_ADDR over every
+ * channel with nonzero capability before doing anything channel-attr
+ * related, which is the structure this follows.
+ */
+typedef struct {
+    uint32_t chan;
+    uint32_t width;
+    uint32_t height;
+    const char *vmm_name;
+} vpss_chn_desc_t;
+
+static const vpss_chn_desc_t VPSS_CHANNELS[] = {
+    {0, 1920, 1080, "vpu-ch-0"},
+    {1, 800, 576, "vpu-ch-1"},
+};
+#define VPSS_CHANNEL_COUNT (sizeof(VPSS_CHANNELS) / sizeof(VPSS_CHANNELS[0]))
+
 static int vpss_setup(int isp_fd, int vmm_fd)
 {
     uint32_t sz = 0, ph = 0;
@@ -179,11 +212,14 @@ static int vpss_setup(int isp_fd, int vmm_fd)
     uint32_t sm[3] = {ph, 0, sz};
     if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_SYS_ADDR, sm) < 0) return -1;
 
-    uint32_t q[4] = {0, 1920, 1080, 0};
-    if (ioctl(isp_fd, ISP_IOCTL_VPSS_GET_CHN_SIZE, q) < 0) return -1;
-    if (vmm_alloc(vmm_fd, q[3], "vpu-ch-0", &ph) < 0) return -1;
-    uint32_t cs[6] = {0, ph, 0, q[3], 1920, 1080};
-    if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_CHN_ADDR, cs) < 0) return -1;
+    for (size_t i = 0; i < VPSS_CHANNEL_COUNT; i++) {
+        const vpss_chn_desc_t *d = &VPSS_CHANNELS[i];
+        uint32_t q[4] = {d->chan, d->width, d->height, 0};
+        if (ioctl(isp_fd, ISP_IOCTL_VPSS_GET_CHN_SIZE, q) < 0) return -1;
+        if (vmm_alloc(vmm_fd, q[3], d->vmm_name, &ph) < 0) return -1;
+        uint32_t cs[6] = {d->chan, ph, 0, q[3], d->width, d->height};
+        if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_CHN_ADDR, cs) < 0) return -1;
+    }
 
     uint32_t vi[62];
     memset(vi, 0, sizeof(vi));
@@ -194,14 +230,19 @@ static int vpss_setup(int isp_fd, int vmm_fd)
     uint32_t en = 0;
     if (ioctl(isp_fd, ISP_IOCTL_VPSS_ENABLE, &en) < 0) return -1;
 
-    uint32_t ca[3] = {0, 1920, 1080};
-    if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_CHN_ATTR, ca) < 0) return -1;
+    for (size_t i = 0; i < VPSS_CHANNEL_COUNT; i++) {
+        const vpss_chn_desc_t *d = &VPSS_CHANNELS[i];
+        uint32_t ca[3] = {d->chan, d->width, d->height};
+        if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_CHN_ATTR, ca) < 0) return -1;
+    }
 
     uint32_t ch = 0;
     if (ioctl(isp_fd, ISP_IOCTL_VPSS_OPEN_CHN, &ch) < 0) return -1;
 
-    uint32_t vo[2] = {0, 1};
-    if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_VO_MODE, vo) < 0) return -1;
+    for (size_t i = 0; i < VPSS_CHANNEL_COUNT; i++) {
+        uint32_t vo[2] = {VPSS_CHANNELS[i].chan, 1};
+        if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_VO_MODE, vo) < 0) return -1;
+    }
 
     return 0;
 }
@@ -370,8 +411,12 @@ typedef struct {
     uint32_t tail[0x50 - 8 - VENC_MAX_PACKS * 3];
 } venc_stream_t;
 
-static int venc_setup(int enc_fd, int vmm_fd, uint32_t chan, uint32_t width, uint32_t height,
-                       uint32_t *buf_phys_out, uint32_t *buf_size_out)
+/*
+ * Sys-level VENC memory pool — once, not per channel. Mirrors _VENC_SysInit
+ * exactly (confirmed from decompile): one shared pool set up before any
+ * channel is created, same pattern as VPSS's SYS_GET_SIZE/SYS_SET_ADDR.
+ */
+static int venc_sys_init(int enc_fd, int vmm_fd)
 {
     uint32_t sys_query[2] = {0, 0}; /* [0] = size, [1] = cached flag */
     if (ioctl(enc_fd, ISP_IOCTL_VENC_SYS_GET_SIZE, sys_query) < 0) {
@@ -388,7 +433,12 @@ static int venc_setup(int enc_fd, int vmm_fd, uint32_t chan, uint32_t width, uin
         perror("VENC_SYS_SET_ADDR");
         return -1;
     }
+    return 0;
+}
 
+static int venc_chn_setup(int enc_fd, int vmm_fd, uint32_t chan, uint32_t width, uint32_t height,
+                           uint32_t bitrate_kbps, uint32_t *buf_phys_out, uint32_t *buf_size_out)
+{
     uint32_t chn_mem_req[5] = {chan, 0, width, height, 0}; /* [4] = codec, 0 = H.264 */
     if (ioctl(enc_fd, ISP_IOCTL_VENC_QUERY_CHN_MEM, chn_mem_req) < 0) {
         perror("VENC_QUERY_CHN_MEM");
@@ -396,8 +446,10 @@ static int venc_setup(int enc_fd, int vmm_fd, uint32_t chan, uint32_t width, uin
     }
     uint32_t chn_buf_size = chn_mem_req[1];
     uint32_t chn_buf_phys = 0;
-    if (vmm_alloc(vmm_fd, chn_buf_size, "venc-chn-0", &chn_buf_phys) < 0) {
-        perror("vmm_alloc(venc-chn-0)");
+    char vmm_name[16];
+    snprintf(vmm_name, sizeof(vmm_name), "venc-chn-%u", chan);
+    if (vmm_alloc(vmm_fd, chn_buf_size, vmm_name, &chn_buf_phys) < 0) {
+        perror("vmm_alloc(venc-chn)");
         return -1;
     }
 
@@ -415,7 +467,7 @@ static int venc_setup(int enc_fd, int vmm_fd, uint32_t chan, uint32_t width, uin
         return -1;
     }
 
-    if (venc_set_rc_attr(enc_fd, chan, 2048) < 0) {
+    if (venc_set_rc_attr(enc_fd, chan, bitrate_kbps) < 0) {
         perror("VENC_SET_RC_ATTR");
         return -1;
     }
@@ -480,9 +532,9 @@ static int venc_get_stream(int enc_fd, int mem_fd, uint32_t chan,
         size_t nal_len;
         strip_start_code(frame_bytes, len, &nal, &nal_len);
         if (nal_len > 0) {
-            rtsp_server_set_param_set(rtsp, nal, nal_len);
+            rtsp_server_set_param_set(rtsp, (int)chan, nal, nal_len);
             int is_last = (i + 1 == stream.pack_count);
-            rtsp_server_send_nal(rtsp, nal, nal_len, rtp_ts, is_last);
+            rtsp_server_send_nal(rtsp, (int)chan, nal, nal_len, rtp_ts, is_last);
         }
 
         munmap(map, len + page_off);
@@ -539,10 +591,19 @@ int main(void)
         return 1;
     }
 
-    uint32_t venc_buf_phys = 0, venc_buf_size = 0;
-    if (venc_setup(enc_fd, vmm_fd, 0, 1920, 1080, &venc_buf_phys, &venc_buf_size) < 0) {
-        fprintf(stderr, "venc_setup failed\n");
+    if (venc_sys_init(enc_fd, vmm_fd) < 0) {
+        fprintf(stderr, "venc_sys_init failed\n");
         return 1;
+    }
+    for (size_t i = 0; i < VPSS_CHANNEL_COUNT; i++) {
+        const vpss_chn_desc_t *d = &VPSS_CHANNELS[i];
+        uint32_t buf_phys = 0, buf_size = 0;
+        uint32_t bitrate_kbps = (d->chan == 0) ? 2048 : 512;
+        if (venc_chn_setup(enc_fd, vmm_fd, d->chan, d->width, d->height, bitrate_kbps,
+                            &buf_phys, &buf_size) < 0) {
+            fprintf(stderr, "venc_chn_setup failed for channel %u\n", d->chan);
+            return 1;
+        }
     }
 
     rtsp_server_t rtsp;
@@ -550,34 +611,45 @@ int main(void)
         fprintf(stderr, "rtsp_server_init failed\n");
         return 1;
     }
+    const char *rtsp_user = getenv("MINI_STREAMER_RTSP_USER");
+    const char *rtsp_pass = getenv("MINI_STREAMER_RTSP_PASS");
+    if (rtsp_user && rtsp_pass) {
+        rtsp_server_set_credentials(&rtsp, rtsp_user, rtsp_pass);
+        fprintf(stderr, "RTSP auth enabled (user: %s)\n", rtsp_user);
+    }
 
-    fprintf(stderr, "Pipeline ready. Streaming H.264 to stdout and rtsp://0.0.0.0:554/stream1\n");
+    fprintf(stderr, "Pipeline ready: rtsp://0.0.0.0:554/stream1 (main), "
+                     "rtsp://0.0.0.0:554/stream2 (sub). Raw H.264 for stream1 also on stdout.\n");
     fprintf(stderr, "Press Ctrl+C to stop\n");
 
     uint32_t frame_count = 0;
-    uint32_t rtp_ts = 0;
+    uint32_t rtp_ts[VPSS_CHANNEL_COUNT] = {0};
     while (g_running) {
         rtsp_server_poll(&rtsp);
 
-        uint32_t frame[26];
-        memset(frame, 0, sizeof(frame));
-        int ret = ioctl(isp_fd, ISP_IOCTL_VPSS_GET_FRAME, frame);
-        if (ret != 0) {
-            usleep(10000);
-            continue;
-        }
+        int any_frame = 0;
+        for (size_t i = 0; i < VPSS_CHANNEL_COUNT; i++) {
+            uint32_t chan = VPSS_CHANNELS[i].chan;
+            uint32_t frame[26];
+            memset(frame, 0, sizeof(frame));
+            frame[0] = chan;
+            if (ioctl(isp_fd, ISP_IOCTL_VPSS_GET_FRAME, frame) != 0)
+                continue;
 
-        int pack_count = venc_get_stream(enc_fd, isp_ctx.mem_fd, 0, &rtsp, rtp_ts);
-        if (pack_count <= 0) {
-            usleep(10000);
-            continue;
-        }
-        rtp_ts += 3600; /* 90000 Hz RTP clock / 25 fps */
+            int pack_count = venc_get_stream(enc_fd, isp_ctx.mem_fd, chan, &rtsp, rtp_ts[i]);
+            if (pack_count <= 0)
+                continue;
+            rtp_ts[i] += 3600; /* 90000 Hz RTP clock / 25 fps */
+            any_frame = 1;
 
-        frame_count++;
-        if (frame_count % 25 == 0) {
-            fprintf(stderr, "Frames: %u (last GetStream: %d packs)\n", frame_count, pack_count);
+            if (chan == 0) {
+                frame_count++;
+                if (frame_count % 25 == 0) {
+                    fprintf(stderr, "Frames: %u (last GetStream: %d packs)\n", frame_count, pack_count);
+                }
+            }
         }
+        if (!any_frame) usleep(10000);
     }
 
     rtsp_server_close(&rtsp);
