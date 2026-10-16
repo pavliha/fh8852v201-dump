@@ -98,8 +98,8 @@ underlying data — reading the raw bytes of the global it dispatches through (`
 - `lf_yoffset()`: confirmed no-op (`return;`, 4 bytes — same pattern as `isp_startup_pkg_init`/
   `Isp_SetMode`/`Chip_Adapt_Init`).
 
-**`isp_startup_IspInPicCfg`** (2026-10-18 addendum — mostly confirmed, two helpers still open):
-its own direct sub-calls, decompiled individually:
+**`isp_startup_IspInPicCfg`** (2026-10-18 — fully confirmed, including the two helpers
+previously flagged as open): its own direct sub-calls, decompiled individually:
 
 - `SetInputPicSize(ctx, w, h)`: registers `0x130`/`0x144` = `(w-1) | (h-1)<<16`.
 - `SetIspPicSize(ctx, w, h)`: a dozen registers (`0x138`, `0x14c`, `0x490`, `0xd0`, `0x500`,
@@ -114,13 +114,17 @@ its own direct sub-calls, decompiled individually:
 - `SetCnrExpTab(ctx)`: a 56-word table (`nr3d_exp_tab`, read via `read_bytes`) copied 1:1 into
   registers `0xb4c` through `0xc28`.
 
-**Still open**: `SetLscTab` and `SetNr3dDrcWin`. Both route through
-`isp_common_set_stat_param`/`isp_common_set_stat_win_param` — a real iterative search algorithm
-(modulo arithmetic, a loop refining a window-size estimate, an `easylog2` call) computing
-statistics-window geometry, not a fixed value or a direct table copy. Decompiled but not yet
-ported to C; porting an algorithm carries more transcription risk than copying literal values; a
-mistake here would be wrong behavior, not a crash, so it's lower urgency than the register-table
-work but still not done.
+- `SetLscTab(ctx, w, h)` and `SetNr3dDrcWin(ctx, w, h)`: route through
+  `isp_common_set_stat_param`/`isp_common_set_stat_win_param` — a real iterative search
+  algorithm (modulo arithmetic, a loop refining a window-size estimate, an `easylog2` call)
+  computing statistics-window geometry, not a fixed value or a direct table copy. Ported
+  goto-for-goto against the decompile (`isp_win_param()`/`isp_set_stat_param()` in
+  `sdk/lib/isp_init.c`) rather than restructured into "cleaner" control flow, specifically to
+  avoid silently changing behavior while porting an algorithm (as opposed to copying a literal
+  value, where there's nothing to get subtly wrong). `SetLscTab` zeros a 299-word register
+  region (`0x1590`-`0x1a38`) then overwrites the last 10 words with block-count-derived values;
+  `SetNr3dDrcWin` runs the search twice (modes 0 and 1) and writes 8 registers per pass
+  (`0x2ac`-`0x2d8`, then `0x604`-`0x62c`).
 
 Neither of these is a dead end anymore. `vi_pol`'s register write is gated on a sensor-specific
 callback this project's `sdk/lib/cv2003_driver.c` doesn't implement, so it correctly stays inert

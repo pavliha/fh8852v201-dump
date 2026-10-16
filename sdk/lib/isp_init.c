@@ -27,14 +27,18 @@
  * writes are intentionally NOT replicated here; every purely numeric
  * write around them is reproduced exactly.
  *
- * isp_set_pic_size() below is UNCHANGED from before this revision:
- * SetInputPicSize/SetIspPicSize/SetIspPicCut/SetLscTab/SetNr3dDrcWin/
- * SetNr3dTab/SetCnrExpTab/SetDehazeTab (the resolution-dependent helper
- * functions isp_startup_IspInPicCfg calls) were not decompiled this
- * round, so those specific register offsets/values remain derived from
- * theory, not confirmed. IspInPicCfg also does one small confirmed
- * bitfield write to register 0x28 driven by an input byte
- * (`*(isp_core+0xd)`, likely sensor orientation/mirror) that has no
+ * isp_set_pic_size() (2026-10-18 revision): SetInputPicSize/SetIspPicSize/
+ * SetIspPicCut/SetNr3dTab/SetDehazeTab/SetCnrExpTab are now confirmed
+ * byte-exact the same way as the rest of this file. SetLscTab and
+ * SetNr3dDrcWin are ALSO now confirmed — not from a value table this
+ * time, but from porting the real algorithm (isp_win_param()/
+ * isp_set_stat_param(), an iterative window-size search, decompiled from
+ * isp_common_set_stat_win_param/isp_common_set_stat_param) line-for-line,
+ * goto-for-goto, rather than reinterpreting its control flow into
+ * "cleaner" C — that's a deliberate choice to minimize the chance of
+ * silently changing its behavior while porting it. IspInPicCfg also does
+ * one small confirmed bitfield write to register 0x28 driven by an input
+ * byte (`*(isp_core+0xd)`, likely sensor orientation/mirror) that has no
  * equivalent source in this file's simpler ctx — intentionally not
  * replicated rather than guessing that input.
  *
@@ -121,24 +125,257 @@ static const uint32_t ISP_CNR_EXP_TABLE[56] = {
     0x00020002, 0x00020002, 0x00010001, 0x00010001, 0x00010001, 0x00010001, 0x00010001, 0x00000001,
 };
 
+/*
+ * Fixed-point log2, confirmed byte-exact port of the real `easylog2`
+ * (2026-10-18). Returns a Q8-ish value: integer part in bits 8+ (×0x100),
+ * fractional part in the low 8 bits. Used by isp_win_param() below.
+ */
+static int easylog2(uint32_t x)
+{
+    uint32_t v5 = x >> 1;
+    uint32_t v1 = 0, v2;
+    int v3, v4;
+
+    if (v5 == 0) {
+        v5 = 8;
+        v3 = 1;
+        v4 = 0;
+    } else {
+        v2 = 0;
+        do {
+            v1 = v2;
+            v5 = v5 >> 1;
+            v2 = v1 + 1;
+        } while (v5 != 0);
+        if (v2 > 7) {
+            return (int)(v2 * 0x100 + ((x - (1u << (v2 & 0xff))) >> ((v1 - 7) & 0xff)));
+        }
+        v5 = 8 - v2;
+        v4 = (int)(v2 * 0x100);
+        v3 = (int)(1u << (v2 & 0xff));
+    }
+    return v4 + (int)((x - (uint32_t)v3) << (v5 & 0xff));
+}
+
+/*
+ * Statistics-window geometry search, confirmed byte-exact port of the
+ * real `isp_common_set_stat_win_param` (2026-10-18) — ported goto-for-goto
+ * against the decompile rather than restructured, to avoid silently
+ * changing behavior while porting an iterative algorithm (as opposed to
+ * copying a fixed value, where there's nothing to get subtly wrong).
+ * `p` is a 5-word view into isp_set_stat_param()'s 21-word array below.
+ */
+static void isp_win_param(uint32_t *p, int mode, int sel)
+{
+    uint32_t v1 = 0, v2, v3, v4, v5 = 0, v6 = 0, v7 = 0;
+
+    if (mode == 0) {
+        if (sel == 1) {
+            v5 = p[4];
+            if (v5 * 10 < 0x43d) { v6 = v5 - 1; v7 = 7; }
+            else { v6 = v5 - 1; v7 = (v5 * 10) / 0x9b; }
+        } else if (sel == 0) {
+            v5 = p[4];
+            if (v5 * 10 < 0x89d) { v6 = v5 - 1; v7 = 7; }
+            else { v6 = v5 - 1; v7 = (v5 * 10) / 0x13b; }
+        } else {
+            goto fallback;
+        }
+        goto common;
+    } else if (mode == 1) {
+        if (sel == 1) {
+            v5 = p[4]; v6 = v5 - 1; v7 = v6 / 0x16 - 1;
+        } else if (sel == 0) {
+            v5 = p[4]; v6 = v5 - 1; v7 = v6 / 0x12 - 1;
+        } else {
+            goto fallback;
+        }
+        goto common;
+    } else {
+        goto fallback;
+    }
+
+common:
+    v3 = (v6 >> 1) - 1;
+    if (p[0] <= v3) v3 = p[0];
+    if (v3 < v7) v3 = v7;
+    p[0] = v3;
+    if ((v3 & 1) != 0) goto after_adjust;
+    goto adjust;
+
+fallback:
+    v5 = p[4];
+    v6 = v5 - 1;
+    v3 = (v6 >> 1) - 1;
+    if (p[0] <= v3) v3 = p[0];
+    p[0] = v3;
+    v7 = 0;
+    if ((v3 & 1) != 0) goto after_adjust;
+
+adjust:
+    if (v7 < v3) { v3 = v3 - 1; p[0] = v3; }
+    else { v3 = v3 + 1; p[0] = v3; }
+
+after_adjust:
+    if (v3 < v7) {
+        v1 = v3 + 1;
+        goto finish;
+    }
+    v1 = v3 + 1;
+    v2 = v5 - (v1 >> 1);
+    v4 = v3;
+    if ((v2 - v1 * (v2 / v1)) - 1 < 7) {
+        do {
+            v3 = v4 - 2;
+            v1 = v4 - 1;
+            v2 = v5 - (v1 >> 1);
+            if (v3 < v7) { p[0] = v3; goto finish; }
+            v4 = v3;
+        } while ((v2 - v1 * (v2 / v1)) - 1 < 7);
+        p[0] = v3;
+    }
+    v7 = v1;
+    if (v3 == 0xffffffffu) v7 = 1;
+    p[2] = v6 / v7 + 1;
+
+finish: ;
+    v5 = (uint32_t)easylog2(v1);
+    v6 = p[0] + 1;
+    v7 = v6 >> 1;
+    if (p[0] == 0xffffffffu) v6 = 1;
+    p[3] = (v5 >> 8) + 2;
+    p[1] = (v7 + (1u << (((v5 >> 8) + 10) & 0xffu))) / v6 - 1;
+}
+
+/*
+ * Confirmed byte-exact port of the real `isp_common_set_stat_param`
+ * (2026-10-18). `a` is a 21-word array: a[18]=height, a[19]=width,
+ * a[20]=mode (0 or 1, selects which of SetLscTab/SetNr3dDrcWin's two
+ * passes this is), set by the caller before each call.
+ */
+static void isp_set_stat_param(uint32_t *a)
+{
+    uint32_t mode = a[20] & 0xff;
+    uint32_t preset_a, preset_b;
+
+    if (mode == 0) {
+        a[2] = 0xe;
+        a[8] = 0x18;
+        a[14] = 6;
+        a[16] = 0x400;
+        preset_b = 0x17;
+        a[12] = 0xcb;
+        preset_a = 0xd;
+    } else if (mode == 1) {
+        preset_a = 8;
+        a[14] = 8;
+        a[8] = 0x10;
+        a[2] = 9;
+        a[12] = 0x6da;
+        a[16] = 0x3000;
+        preset_b = 0xf;
+    } else {
+        preset_a = a[2] - 1;
+        preset_b = a[8] - 1;
+        if (preset_a == 0) preset_a = 1;
+        if (preset_b == 0) preset_b = 1;
+    }
+    a[4] = a[18];
+    a[10] = a[19];
+    a[17] = 1;
+    a[6] = (a[19] - 1u) / preset_b - 1;
+    a[0] = (a[18] - 1u) / preset_a - 1;
+    a[5] = 0;
+    a[11] = 0;
+    isp_win_param(a + 0, (int)mode, 0);
+    isp_win_param(a + 6, (int)mode, (int)a[11]);
+    isp_win_param(a + 12, (int)mode, (int)a[17]);
+}
+
+/*
+ * Confirmed byte-exact port of the real `SetNr3dDrcWin` (2026-10-18):
+ * two passes of isp_set_stat_param (mode 0, then mode 1), each writing
+ * the same 8-register pattern extracted from the resulting 21-word array.
+ */
+static void isp_set_nr3d_drc_win(isp_ctx_t *ctx, uint32_t width, uint32_t height)
+{
+    volatile uint32_t *R = ctx->regs;
+    uint32_t a[21];
+    memset(a, 0, sizeof(a));
+    a[18] = height;
+    a[19] = width;
+
+    a[20] = 0;
+    isp_set_stat_param(a);
+    R[0x2ac/4] = (a[14] << 16) | (a[8] << 8) | a[2];
+    R[0x2b0/4] = a[0] | (a[6] << 16);
+    R[0x2b4/4] = a[12];
+    R[0x2b8/4] = (a[7] << 16) | (a[3] << 10) | a[1] | (a[9] << 26);
+    R[0x2bc/4] = a[13] | (a[15] << 10);
+    R[0x2d0/4] = (a[14] << 16) | (a[8] << 8) | a[2];
+    R[0x2d4/4] = a[0] | (a[6] << 16);
+    R[0x2d8/4] = a[12];
+
+    a[20] = 1;
+    isp_set_stat_param(a);
+    R[0x604/4] = (a[14] << 16) | (a[8] << 8) | a[2];
+    R[0x608/4] = a[0] | (a[6] << 16);
+    R[0x60c/4] = a[12];
+    R[0x610/4] = (a[7] << 16) | (a[3] << 10) | a[1] | (a[9] << 26);
+    R[0x614/4] = a[13] | (a[15] << 10);
+    R[0x624/4] = (a[14] << 16) | (a[8] << 8) | a[2];
+    R[0x628/4] = a[0] | (a[6] << 16);
+    R[0x62c/4] = a[12];
+}
+
+/*
+ * Confirmed byte-exact port of the real `SetLscTab` (2026-10-18). Zeros a
+ * 299-word register region (0x1590-0x1a38) then overwrites the last 10
+ * words with block-count-derived values — matches the real function's
+ * mostly-zero local buffer with 10 explicit tail writes, copied out via a
+ * loop this port collapses into direct writes (same end state, no loop
+ * needed since every zeroed word stays zero). Only the width/height>=0
+ * path applies — this project never calls it with negative crop values.
+ */
+static void isp_set_lsc_tab(isp_ctx_t *ctx, uint32_t width, uint32_t height)
+{
+    volatile uint32_t *R = ctx->regs;
+    uint32_t blk_w = width >> 5;
+    uint32_t blk_h = height >> 5;
+
+    for (uint32_t off = 0x1590; off <= 0x1a38; off += 4) {
+        R[off/4] = 0;
+    }
+
+    uint32_t v0 = (blk_w << 16) | (blk_w << 24) | (blk_w << 8);
+    uint32_t v1 = blk_w | v0;
+    uint32_t v5 = (blk_h << 16) | (blk_h << 24) | (blk_h << 8);
+    uint32_t v6 = blk_h | v5;
+
+    R[0x1a14/4] = v0;
+    R[0x1a18/4] = v1;
+    R[0x1a1c/4] = v1;
+    R[0x1a20/4] = v1;
+    R[0x1a24/4] = blk_w - 1;
+    R[0x1a28/4] = v5;
+    R[0x1a2c/4] = v6;
+    R[0x1a30/4] = v6;
+    R[0x1a34/4] = v6;
+    R[0x1a38/4] = blk_h - 1;
+}
+
 /**
  * Picture size / crop / stride / stat-window registers.
  *
  * CONFIRMED (2026-10-18) from decompiling isp_startup_IspInPicCfg's real
- * helpers: SetInputPicSize (0x130/0x144), SetIspPicSize (0x138/0x14c/0x490/
- * 0xd0/0x500/0x504/0x508/0x4e0/0x4e4/0x4e8/0x2e8/0x2f0/0x2f8/0x300/0x308/
- * 0x310/0x318/0x320/0x41c/0xaa8/0x648/0x658), SetIspPicCut (0x134/0x148),
- * and SetCnrExpTab (the table above, offsets 0xb4c-0xc28). SetNr3dTab and
- * SetDehazeTab are confirmed no-ops — nothing to call for them.
- *
- * STILL NOT DECOMPILED: SetLscTab and SetNr3dDrcWin. Both route through
- * isp_common_set_stat_param/isp_common_set_stat_win_param, an iterative
- * search algorithm (not a fixed formula) computing statistics-window
- * geometry — a real algorithm to port, not a value table, and not done
- * yet. No crop offset equivalent exists in this file's ctx either (the
- * real IspInPicCfg takes crop x/y from isp_core fields this file has no
- * equivalent for); SetIspPicCut is called with (0,0), full-frame, which
- * is what the pre-existing code already assumed.
+ * helpers: SetInputPicSize, SetIspPicSize, SetIspPicCut, SetLscTab,
+ * SetNr3dDrcWin, SetCnrExpTab — all byte-exact now, the last two via a
+ * ported algorithm rather than a value table (see isp_win_param() and
+ * isp_set_lsc_tab() above). SetNr3dTab and SetDehazeTab are confirmed
+ * no-ops — nothing to call for them. No crop offset equivalent exists in
+ * this file's ctx (the real IspInPicCfg takes crop x/y from isp_core
+ * fields this file has no equivalent for); SetIspPicCut is called with
+ * (0,0), full-frame, which is what the pre-existing code already assumed.
  */
 static void isp_set_pic_size(isp_ctx_t *ctx)
 {
@@ -185,6 +422,10 @@ static void isp_set_pic_size(isp_ctx_t *ctx)
     /* SetIspPicCut(ctx, 0, 0) — full frame, no crop */
     R[0x134/4] = 0;
     R[0x148/4] = 0;
+
+    isp_set_lsc_tab(ctx, w, h);
+    isp_set_nr3d_drc_win(ctx, w, h);
+    /* SetNr3dTab(): confirmed no-op */
 
     /* SetCnrExpTab(ctx): direct 1:1 copy, register offset 0xb4c + i*4 = table[i] */
     for (size_t i = 0; i < 56; i++) {
