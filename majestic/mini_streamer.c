@@ -43,13 +43,27 @@
  *     bytes out of the stream packs (mmap of /dev/mem at the reported phys
  *     addr) is this code's own addition — there's no vendor majestic path
  *     on this chip to decompile for that step, so it follows the same
- *     mmap pattern already used for ISP/VPSS DMA buffers.
+ *     mmap pattern already used for ISP/VPSS DMA buffers. Each pack is
+ *     assumed to be one complete H.264 NAL unit (addr/length/type triple)
+ *     — this matches standard hardware-encoder convention and the pack
+ *     struct's own shape, but it is an INFERENCE, not confirmed by decompile:
+ *     FH_VENC_GetStream has no internal caller in this binary to check it
+ *     against (xref search came up empty — either dynamic dispatch or dead
+ *     code in this firmware build), so there's no vendor reference consumer
+ *     to verify against.
+ *
+ *   FROM-SPEC, NOT DECOMPILED: the RTSP/RTP server (rtsp_server.c). Built
+ *     directly from RFC 2326 and RFC 6184, deliberately without consulting
+ *     majestic's or ipcam's own RTSP implementation — this is public
+ *     protocol, not vendor logic, so there was nothing to clean-room here
+ *     at all. Scope: one stream, H.264/UDP only, no auth. See
+ *     rtsp_server.h for the exact method/feature list.
  *
  * Usage:
  *   echo V > /dev/watchdog   # magic close, disables watchdog
  *   killall ipcam
- *   ./mini_streamer > /tmp/stream.h264
- *   ./mini_streamer | ffplay -f h264 -
+ *   ./mini_streamer
+ *   # then: ffplay rtsp://<device-ip>:554/stream1
  */
 
 #include <stdio.h>
@@ -65,6 +79,7 @@
 #include "../sdk/lib/isp_init.h"
 #include "../sdk/lib/isp_buf_addr.h"
 #include "../sdk/lib/cv2003_driver.h"
+#include "rtsp_server.h"
 
 /* ---- proven VMM alloc ioctl, byte-for-byte from test_minimal_regs.c ---- */
 #define VMM_IOCTL_ALLOC 0xC0506D0A
@@ -416,11 +431,29 @@ static int venc_setup(int enc_fd, int vmm_fd, uint32_t chan, uint32_t width, uin
 }
 
 /*
- * One GetStream/ReleaseStream cycle. Pack addresses point into DMA memory,
- * not process memory — each pack is mmap'd from /dev/mem and copied to
- * stdout, then unmapped, before the stream handle is released.
+ * Strip a leading Annex-B start code, if present. The "one pack = one NAL"
+ * assumption (see file header) means this is defensive, not load-bearing —
+ * if the hardware already hands back NALs without start codes, off stays 0.
  */
-static int venc_get_stream(int enc_fd, int mem_fd, uint32_t chan)
+static void strip_start_code(const uint8_t *buf, size_t len, const uint8_t **nal, size_t *nal_len)
+{
+    size_t off = 0;
+    if (len >= 4 && buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 1)
+        off = 4;
+    else if (len >= 3 && buf[0] == 0 && buf[1] == 0 && buf[2] == 1)
+        off = 3;
+    *nal = buf + off;
+    *nal_len = len - off;
+}
+
+/*
+ * One GetStream/ReleaseStream cycle. Pack addresses point into DMA memory,
+ * not process memory — each pack is mmap'd from /dev/mem, written to stdout
+ * (preserving the raw-H.264-on-stdout usage mode) and handed to the RTSP
+ * server as one NAL, then unmapped, before the stream handle is released.
+ */
+static int venc_get_stream(int enc_fd, int mem_fd, uint32_t chan,
+                            rtsp_server_t *rtsp, uint32_t rtp_ts)
 {
     venc_stream_t stream;
     memset(&stream, 0, sizeof(stream));
@@ -439,7 +472,19 @@ static int venc_get_stream(int enc_fd, int mem_fd, uint32_t chan)
         void *map = mmap(NULL, len + page_off, PROT_READ, MAP_SHARED, mem_fd, phys & ~0xFFFUL);
         if (map == MAP_FAILED)
             continue;
-        write(STDOUT_FILENO, (uint8_t *)map + page_off, len);
+
+        const uint8_t *frame_bytes = (uint8_t *)map + page_off;
+        write(STDOUT_FILENO, frame_bytes, len);
+
+        const uint8_t *nal;
+        size_t nal_len;
+        strip_start_code(frame_bytes, len, &nal, &nal_len);
+        if (nal_len > 0) {
+            rtsp_server_set_param_set(rtsp, nal, nal_len);
+            int is_last = (i + 1 == stream.pack_count);
+            rtsp_server_send_nal(rtsp, nal, nal_len, rtp_ts, is_last);
+        }
+
         munmap(map, len + page_off);
     }
 
@@ -500,11 +545,20 @@ int main(void)
         return 1;
     }
 
-    fprintf(stderr, "Pipeline ready. Streaming H.264 to stdout...\n");
+    rtsp_server_t rtsp;
+    if (rtsp_server_init(&rtsp, 554) < 0) {
+        fprintf(stderr, "rtsp_server_init failed\n");
+        return 1;
+    }
+
+    fprintf(stderr, "Pipeline ready. Streaming H.264 to stdout and rtsp://0.0.0.0:554/stream1\n");
     fprintf(stderr, "Press Ctrl+C to stop\n");
 
     uint32_t frame_count = 0;
+    uint32_t rtp_ts = 0;
     while (g_running) {
+        rtsp_server_poll(&rtsp);
+
         uint32_t frame[26];
         memset(frame, 0, sizeof(frame));
         int ret = ioctl(isp_fd, ISP_IOCTL_VPSS_GET_FRAME, frame);
@@ -513,11 +567,12 @@ int main(void)
             continue;
         }
 
-        int pack_count = venc_get_stream(enc_fd, isp_ctx.mem_fd, 0);
+        int pack_count = venc_get_stream(enc_fd, isp_ctx.mem_fd, 0, &rtsp, rtp_ts);
         if (pack_count <= 0) {
             usleep(10000);
             continue;
         }
+        rtp_ts += 3600; /* 90000 Hz RTP clock / 25 fps */
 
         frame_count++;
         if (frame_count % 25 == 0) {
@@ -525,6 +580,7 @@ int main(void)
         }
     }
 
+    rtsp_server_close(&rtsp);
     fprintf(stderr, "\nStopping... (%u frames captured)\n", frame_count);
 
     cv2003_deinit();
