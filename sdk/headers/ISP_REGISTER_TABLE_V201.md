@@ -36,8 +36,7 @@ isp_startup_Chip_Adapt_Init()   // confirmed no-op
 [optional sensor vtable hook]   // not statically resolvable; not exercised by this project
 isp_startup_IspInPicCfg()       // resolution-dependent helpers (SetInputPicSize etc.) — NOT
                                  // decompiled this round; isp_set_pic_size() stays theory-derived
-sensorDp_setAttribute2Isp()     // dispatches through a sensor function-pointer table Ghidra
-                                 // couldn't resolve statically ("too many branches") — open gap
+sensorDp_setAttribute2Isp()     // confirmed resolved (2026-10-17 addendum) — see below
 isp_startup_Isp_PkgEnable()     // register table, part 3 — see below
 ```
 
@@ -86,6 +85,24 @@ only when the caller's parameter is 0. That parameter's real runtime value isn't
 this file alone (the call site's apparent 12 arguments are a decompiler artifact — the function
 body itself takes exactly one parameter). `isp_apply_module_bypass()` assumes the 0 path
 unconditionally; flagged as an assumption, not a resolved fact.
+
+**`sensorDp_setAttribute2Isp`** (2026-10-17 addendum — resolved, previously flagged as
+unresolvable dynamic dispatch): Ghidra's initial decompile of this function's indirect-call site
+emitted a "could not recover jumptable... too many branches" warning and produced a garbled
+2-argument-mismatch pseudocode. That warning is about the call site's own disassembly, not the
+underlying data — reading the raw bytes of the global it dispatches through (`attribute_lut`,
+8 bytes) shows exactly two real code pointers, not a large table:
+
+- `vi_pol(isp_core, sensor_ops)`: if `sensor_ops+0x34` (a named-attribute-query callback) is
+  non-null, calls it with the string `"VI_POL"`; on success, sets 2 bits of register `0x100`
+  from the returned value (`(reg & 0xFFFFFFF2) | (value << 2)`).
+- `lf_yoffset()`: confirmed no-op (`return;`, 4 bytes — same pattern as `isp_startup_pkg_init`/
+  `Isp_SetMode`/`Chip_Adapt_Init`).
+
+Neither of these is a dead end anymore. `vi_pol`'s register write is gated on a sensor-specific
+callback this project's `sdk/lib/cv2003_driver.c` doesn't implement, so it correctly stays inert
+in this pipeline — not an unresolved gap, a confirmed no-op in this specific context. Not
+replicated in `isp_init.c` for that reason, intentionally.
 
 ## What this does and doesn't fix
 
