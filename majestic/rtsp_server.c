@@ -20,6 +20,7 @@
 #define PT_H264 96
 #define PT_METADATA 107
 #define METADATA_INTERVAL_US 1000000u
+#define STREAM_SLOTS 3
 #define NAL_SEI 6
 #define NAL_SPS 7
 #define NAL_PPS 8
@@ -228,7 +229,7 @@ static void send_metadata(rtsp_server_t *srv, rtsp_client_t *c)
                      "<tt:Frame UtcTime=\"%s\"><tt:Extension><tt:MotionInCells Columns=\"22\" Rows=\"18\" "
                      "Cells=\"zwA=\"/></tt:Extension></tt:Frame></tt:VideoAnalytics></tt:MetadataStream>",
                      utc);
-    uint32_t ts = srv->metadata_ts_base + (uint32_t)(now_us() * 9u / 100u);
+    uint32_t ts = (uint32_t)((now_us() + srv->metadata_ts_base) * 9u / 100u);
     rtp_send(c, &c->tracks[RTSP_TRACK_METADATA], PT_METADATA, 1, ts, NULL, 0, (const uint8_t *)xml, (size_t)n);
 }
 
@@ -259,7 +260,13 @@ static int bind_udp_pair(rtsp_track_t *t)
 static int stream_of(const char *uri)
 {
     const char *p = strstr(uri, "stream=");
-    return p ? atoi(p + strlen("stream=")) : 0;
+    int s = p ? atoi(p + strlen("stream=")) : 0;
+    return s < 0 || s >= STREAM_SLOTS ? 0 : s;
+}
+
+static int stream_enabled(rtsp_server_t *srv, int s)
+{
+    return s < RTSP_STREAM_COUNT && srv->stream_enabled[s];
 }
 
 static int ends_with(const char *s, const char *suffix)
@@ -278,11 +285,14 @@ static int auth_ok(rtsp_server_t *srv, rtsp_client_t *c, const char *req, const 
         reply(c, cseq, "401 Authentication required", challenge);
         return 0;
     }
+    if (strncmp(auth, "Basic ", 6) != 0) {
+        reply(c, cseq, "401 Basic authentication required", challenge);
+        return 0;
+    }
     char decoded[128] = {0};
     char expected[80];
     snprintf(expected, sizeof(expected), "%s:%s", srv->auth_user, srv->auth_pass);
-    if (strncmp(auth, "Basic ", 6) == 0)
-        base64_decode(auth + 6, decoded, sizeof(decoded));
+    base64_decode(auth + 6, decoded, sizeof(decoded));
     if (strcmp(decoded, expected) != 0) {
         reply(c, cseq, "401 Invalid credentials", challenge);
         return 0;
@@ -307,8 +317,10 @@ static int session_ok(rtsp_client_t *c, const char *req, const char *cseq)
 static int handle_describe(rtsp_server_t *srv, rtsp_client_t *c, const char *uri, const char *cseq)
 {
     int s = stream_of(uri);
-    if (s < 0 || s >= RTSP_STREAM_COUNT || !srv->stream_enabled[s])
-        s = 0;
+    if (!stream_enabled(srv, s)) {
+        reply(c, cseq, "404 Stream not found", NULL);
+        return 1;
+    }
     if (!srv->sps_len[s] || !srv->pps_len[s])
         return 0;
     char sps64[192], pps64[192], sdp[1024], head[512];
@@ -318,9 +330,10 @@ static int handle_describe(rtsp_server_t *srv, rtsp_client_t *c, const char *uri
                            "v=0\r\no=OpenIPC 0 0 IN IP4 0.0.0.0\r\ns=Majestic\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\n"
                            "m=video 0 RTP/AVP 96\r\na=control:video\r\na=rtpmap:96 H264/90000\r\n"
                            "a=fmtp:96 profile-level-id=%02x%02x%02x;packetization-mode=1;sprop-parameter-sets=%s,%s\r\n"
-                           "a=framerate:%u\r\n"
-                           "m=application 0 RTP/AVP 107\r\na=rtpmap:107 vnd.onvif.metadata/90000\r\na=control:metadata\r\n",
-                           srv->sps[s][1], srv->sps[s][2], srv->sps[s][3], sps64, pps64, srv->fps[s]);
+                           "a=framerate:%u\r\n%s",
+                           srv->sps[s][1], srv->sps[s][2], srv->sps[s][3], sps64, pps64, srv->fps[s],
+                           s == 0 ? "m=application 0 RTP/AVP 107\r\na=rtpmap:107 vnd.onvif.metadata/90000\r\n"
+                                    "a=control:metadata\r\n" : "");
     int head_len = snprintf(head, sizeof(head),
                             "RTSP/1.0 200 OK\r\nCSeq: %s\r\nContent-Length: %d\r\nServer: " SERVER_NAME
                             "\r\nContent-Base: %s\r\nContent-Type: application/sdp\r\n\r\n",
@@ -333,7 +346,7 @@ static int handle_describe(rtsp_server_t *srv, rtsp_client_t *c, const char *uri
 static void handle_setup(rtsp_server_t *srv, rtsp_client_t *c, const char *req, const char *uri, const char *cseq)
 {
     int s = stream_of(uri);
-    if (s < 0 || s >= RTSP_STREAM_COUNT || !srv->stream_enabled[s]) {
+    if (!stream_enabled(srv, s)) {
         reply(c, cseq, "404 Stream not found", NULL);
         return;
     }
@@ -411,6 +424,8 @@ static int handle_request(rtsp_server_t *srv, rtsp_client_t *c, const char *req)
             c->playing = 1;
             c->waiting_for_sps = 1;
             c->next_metadata_us = now_us();
+            if (srv->request_idr)
+                srv->request_idr(srv->request_idr_ctx, c->stream_id);
         }
     } else if (strcmp(method, "GET_PARAMETER") == 0) {
         reply(c, cseq, "200 OK", NULL);
@@ -481,6 +496,12 @@ void rtsp_server_enable_stream(rtsp_server_t *srv, int stream_id, unsigned fps)
         return;
     srv->stream_enabled[stream_id] = 1;
     srv->fps[stream_id] = fps;
+}
+
+void rtsp_server_on_idr_request(rtsp_server_t *srv, rtsp_idr_request_fn fn, void *ctx)
+{
+    srv->request_idr = fn;
+    srv->request_idr_ctx = ctx;
 }
 
 void rtsp_server_poll(rtsp_server_t *srv)
@@ -561,7 +582,7 @@ void rtsp_server_push_nal(rtsp_server_t *srv, int stream_id, const uint8_t *nal,
     int type = nal[0] & 0x1f;
     if (type == NAL_SEI)
         return;
-    uint32_t ts = srv->video_ts_base[stream_id] + (uint32_t)(pts_us * 9u / 100u);
+    uint32_t ts = (uint32_t)((pts_us + srv->video_ts_base[stream_id]) * 9u / 100u);
     for (int i = 0; i < RTSP_MAX_CLIENTS; i++) {
         rtsp_client_t *c = &srv->clients[i];
         if (c->tcp_fd < 0 || !c->playing || c->stream_id != stream_id || !c->tracks[RTSP_TRACK_VIDEO].active)

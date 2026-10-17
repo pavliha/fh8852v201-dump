@@ -20,10 +20,10 @@ video0:
   rcMode: vbr
   gopSize: 2
 video1:
-  enabled: false
-  #codec: h265
+  enabled: true
+  codec: h264
   size: 704x576
-  fps: 15
+  fps: 25
 jpeg:
   enabled: false
   qfactor: 50

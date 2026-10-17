@@ -58,10 +58,10 @@ def header(msg, name):
     return next((l.split(':', 1)[1].strip() for l in msg.split('\r\n') if l.lower().startswith(name + ':')), None)
 
 
-def session(host, port, transport, packet_target):
+def session(host, port, transport, packet_target, path='/stream=0'):
     c = Conn(host, port)
     log = []
-    url = f'rtsp://{host}:{port}/stream=0'
+    url = f'rtsp://{host}:{port}{path}'
     h = f'Authorization: {AUTH}\r\nUser-Agent: oracle\r\n'
     c.request(f'OPTIONS {url} RTSP/1.0\r\nCSeq: 1\r\n{h}\r\n', log)
     d = c.request(f'DESCRIBE {url} RTSP/1.0\r\nCSeq: 2\r\n{h}Accept: application/sdp\r\n\r\n', log)
@@ -142,10 +142,52 @@ def error_cases(host, port):
         f'GET_PARAMETER {u}/stream=0 RTSP/1.0\r\nCSeq: 11\r\nUser-Agent: oracle\r\n\r\n',
         f'TEARDOWN {u}/stream=0 RTSP/1.0\r\nCSeq: 12\r\nUser-Agent: oracle\r\n\r\n',
         f'SETUP {u}/stream=0/video RTSP/1.0\r\nCSeq: 13\r\nTransport: RTP/AVP/TCP;unicast;interleaved=4-5\r\nUser-Agent: oracle\r\n\r\n',
-        f'SETUP {u}/stream=1/video RTSP/1.0\r\nCSeq: 14\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nUser-Agent: oracle\r\n\r\n',
+        f'SETUP {u}/stream=2/video RTSP/1.0\r\nCSeq: 14\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nUser-Agent: oracle\r\n\r\n',
+        f'DESCRIBE {u}/stream=0?audio=opus RTSP/1.0\r\nCSeq: 16\r\nUser-Agent: oracle\r\n\r\n',
+        f'DESCRIBE {u}/stream=1 RTSP/1.0\r\nCSeq: 17\r\nUser-Agent: oracle\r\n\r\n',
+        f'DESCRIBE {u}/stream=2 RTSP/1.0\r\nCSeq: 18\r\nUser-Agent: oracle\r\n\r\n',
+        f'DESCRIBE {u}/stream=3 RTSP/1.0\r\nCSeq: 19\r\nUser-Agent: oracle\r\n\r\n',
+        f'DESCRIBE {u}/stream=abc RTSP/1.0\r\nCSeq: 20\r\nUser-Agent: oracle\r\n\r\n',
+        f'DESCRIBE {u}/stream=1x RTSP/1.0\r\nCSeq: 21\r\nUser-Agent: oracle\r\n\r\n',
+        f'DESCRIBE {u}/ RTSP/1.0\r\nCSeq: 22\r\nUser-Agent: oracle\r\n\r\n',
+        f'SETUP {u}/stream=9/video RTSP/1.0\r\nCSeq: 23\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nUser-Agent: oracle\r\n\r\n',
+        f'SETUP {u}/stream=0/foo RTSP/1.0\r\nCSeq: 24\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\nUser-Agent: oracle\r\n\r\n',
+        f'SETUP {u}/stream=1/metadata RTSP/1.0\r\nCSeq: 25\r\nTransport: RTP/AVP/TCP;unicast;interleaved=2-3\r\nUser-Agent: oracle\r\n\r\n',
+        f'SETUP {u}/stream=0/video RTSP/1.0\r\nCSeq: 26\r\nTransport: RTP/AVP/TCP;unicast\r\nUser-Agent: oracle\r\n\r\n',
         f'SETUP {u}/stream=0/video RTSP/1.0\r\nCSeq: 15\r\nTransport: RTP/AVP;multicast\r\nUser-Agent: oracle\r\n\r\n',
     ]
     return [single(host, port, r) for r in requests]
+
+
+def auth_cases(port):
+    host = socket.gethostbyname(socket.gethostname())
+    u = f'rtsp://{host}:{port}/stream=0'
+    creds = [
+        '',
+        f'Authorization: {AUTH}\r\n',
+        f'Authorization: Basic {base64.b64encode(b"root:bad").decode()}\r\n',
+        f'Authorization: Basic {base64.b64encode(b"nobody:12345").decode()}\r\n',
+        'Authorization: Digest username="root", realm="WallyWorld", nonce="x", uri="/stream=0", response="0"\r\n',
+        'Authorization: Basic !!!\r\n',
+    ]
+    return [single(host, port, f'{m} {u} RTSP/1.0\r\nCSeq: {i}\r\n{c}User-Agent: oracle\r\n\r\n')
+            for i, (m, c) in enumerate([(m, c) for m in ('OPTIONS', 'DESCRIBE') for c in creds], 1)]
+
+
+def concurrent(host, port, packet_target):
+    import threading
+    results = [None, None]
+
+    def run(i):
+        time.sleep(i * 0.7)
+        results[i] = session(host, port, 'tcp', packet_target)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    return results
 
 
 if __name__ == '__main__':
@@ -157,8 +199,12 @@ if __name__ == '__main__':
     a = ap.parse_args()
     out = {
         'errors': error_cases(a.host, a.port),
-        'sessions': [session(a.host, a.port, 'tcp', a.packets), session(a.host, a.port, 'udp', a.packets)],
+        'auth': auth_cases(a.port),
+        'sessions': [session(a.host, a.port, 'tcp', a.packets), session(a.host, a.port, 'udp', a.packets),
+                     session(a.host, a.port, 'tcp', a.packets, '/stream=1')],
+        'concurrent': concurrent(a.host, a.port, 150),
         'two_tracks': two_tracks(a.host, a.port, 12),
     }
     json.dump(out, open(a.out, 'w'), indent=1)
-    print(a.out, [len(s['packets']) for s in out['sessions']], len(out['two_tracks']['packets']))
+    print(a.out, [len(s['packets']) for s in out['sessions']], [len(s['packets']) for s in out['concurrent']],
+          len(out['two_tracks']['packets']))

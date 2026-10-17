@@ -13,6 +13,7 @@ def check(cond, what):
 
 
 def norm(text):
+    text = re.sub(r'rtsp://[0-9.]+:', 'rtsp://<host>:', text)
     text = re.sub(r'Session: \d+', 'Session: <id>', text)
     text = re.sub(r'server_port=(\d+)-(\d+)',
                   lambda m: 'server_port=<p>-<p+1>' if int(m.group(2)) == int(m.group(1)) + 1 else m.group(0), text)
@@ -70,10 +71,13 @@ def compare_video(name, expected_pkts, actual_pkts):
             if ref:
                 failures.append(f'  ours: {[(m, len(p)) for m, p in u["packets"]][:6]}\n  majestic: {[(m, len(p)) for m, p in ref["packets"]][:6]}')
             break
-    for a, b in zip(au, au[1:-1]):
-        key = (a['key'], b['key'])
+    steps = [((a['key'], b['key']), (b['ts'] - a['ts']) & 0xffffffff) for a, b in zip(au, au[1:-1])]
+    for (key, step) in steps:
         if key in transitions:
-            check((b['ts'] - a['ts']) & 0xffffffff == transitions[key], f'{name}: timestamp step differs from majestic')
+            check(abs(step - transitions[key]) <= 1, f'{name}: timestamp step {step} vs majestic {transitions[key]}')
+    for (k1, s1), (k2, s2) in zip(steps, steps[1:]):
+        if k1 in transitions and k2 in transitions:
+            check(s1 + s2 == transitions[k1] + transitions[k2], f'{name}: two-frame timestamp span differs from majestic')
     rtcp = [bytes.fromhex(p['hex']) for p in actual_pkts if p['channel'] == 1]
     check(rtcp == [bye(act[0]['ssrc'])], f'{name}: RTCP should be exactly one BYE, got {[r.hex() for r in rtcp]}')
 
@@ -98,9 +102,16 @@ def main(expected_path, actual_path):
     expected = json.load(open(expected_path))
     actual = json.load(open(actual_path))
     compare_exchanges('errors', expected['errors'], actual['errors'])
-    for e, a in zip(expected['sessions'], actual['sessions']):
-        compare_exchanges(f'{a["transport"]} session', e['exchanges'], a['exchanges'])
-        compare_video(f'{a["transport"]} session', e['packets'], a['packets'])
+    compare_exchanges('auth', expected['auth'], actual['auth'])
+    names = ['tcp stream=0', 'udp stream=0', 'tcp stream=1']
+    for name, e, a in zip(names, expected['sessions'], actual['sessions']):
+        compare_exchanges(name, e['exchanges'], a['exchanges'])
+        compare_video(name, e['packets'], a['packets'])
+    for i, (e, a) in enumerate(zip(expected['concurrent'], actual['concurrent'])):
+        compare_exchanges(f'concurrent {i}', e['exchanges'], a['exchanges'])
+        compare_video(f'concurrent {i}', e['packets'], a['packets'])
+    ssrcs = {parse(s['packets'][0]['hex'])['ssrc'] for s in actual['concurrent']}
+    check(len(ssrcs) == 2, 'concurrent sessions share an SSRC')
     compare_exchanges('two tracks', expected['two_tracks']['exchanges'], actual['two_tracks']['exchanges'])
     compare_metadata(expected['two_tracks'], actual['two_tracks'])
     if failures:

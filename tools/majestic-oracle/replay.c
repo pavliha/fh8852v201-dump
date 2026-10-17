@@ -77,6 +77,7 @@ int main(int argc, char **argv)
     }
     rtsp_server_set_credentials(&srv, "root", "12345");
     rtsp_server_enable_stream(&srv, 0, 25);
+    rtsp_server_enable_stream(&srv, 1, 25);
     fprintf(stderr, "replay: %d NALs, %d access units, RTSP on :554\n", g_nal_count, g_au_count);
     uint64_t next = now_us();
     for (uint32_t seq = 0;; seq++) {
@@ -87,9 +88,11 @@ int main(int argc, char **argv)
         next += FRAME_INTERVAL_US;
         int au = (int)(seq % (uint32_t)g_au_count);
         uint64_t pts = pts0 + (uint64_t)seq * FRAME_INTERVAL_US + ((seq & 1) ? ODD_FRAME_JITTER_US : 0);
-        for (int k = 0; k < g_au_count_nals[au]; k++) {
-            const nal_t *n = &g_nals[g_au_first[au] + k];
-            rtsp_server_push_nal(&srv, 0, n->p, n->len, pts, k == g_au_count_nals[au] - 1);
+        for (int stream = 0; stream < 2; stream++) {
+            for (int k = 0; k < g_au_count_nals[au]; k++) {
+                const nal_t *n = &g_nals[g_au_first[au] + k];
+                rtsp_server_push_nal(&srv, stream, n->p, n->len, pts, k == g_au_count_nals[au] - 1);
+            }
         }
     }
 }

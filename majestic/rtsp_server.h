@@ -38,8 +38,12 @@ typedef struct {
     size_t rxlen;
 } rtsp_client_t;
 
+typedef void (*rtsp_idr_request_fn)(void *ctx, int stream_id);
+
 typedef struct {
     int listen_fd;
+    rtsp_idr_request_fn request_idr;
+    void *request_idr_ctx;
     rtsp_client_t clients[RTSP_MAX_CLIENTS];
     int stream_enabled[RTSP_STREAM_COUNT];
     unsigned fps[RTSP_STREAM_COUNT];
@@ -57,6 +61,7 @@ typedef struct {
 int rtsp_server_init(rtsp_server_t *srv, uint16_t port);
 void rtsp_server_set_credentials(rtsp_server_t *srv, const char *user, const char *pass);
 void rtsp_server_enable_stream(rtsp_server_t *srv, int stream_id, unsigned fps);
+void rtsp_server_on_idr_request(rtsp_server_t *srv, rtsp_idr_request_fn fn, void *ctx);
 void rtsp_server_poll(rtsp_server_t *srv);
 void rtsp_server_push_nal(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len,
                           uint64_t pts_us, int is_last_in_frame);
