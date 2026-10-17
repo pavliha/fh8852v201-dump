@@ -222,8 +222,8 @@ the clean-room libraries in `sdk/lib/`. Read this before trusting any one part.
 | ISP register-table bring-up (`sdk/lib/isp_init.c`) | **Values byte-exact, access safety still blocked.** Offsets and values from `isp_startup_Ispp_Init`/`Ispf_Init`/`Isp_PkgEnable`/`isp_core_system_reset`, and `isp_set_pic_size` (`IspInPicCfg`) including the `SetLscTab`/`SetNr3dDrcWin` search. Whether writing these via `/dev/mem` while `isp.ko` is loaded is safe at all (memory-attribute mismatch / IRQ race, see `ISP_BUF_ADDR_PROTOCOL_V201.md`) is untested. If the device hangs here, it is this step, not the VPSS/VMM/buffer-address work before it. |
 | ISP ioctl prelude in `isp_setup()` (up to `0x690A`) | **Not vendor order.** Follows `test_minimal_regs.c`'s hardware-run sequence, which does not fully agree with `isp_core_init`'s decompiled order. After `0x690A` it follows the vendor: buffer-address allocation, then the register table (`isp_hw_init`), then `PkgEnable`. |
 | VENC setup and stream-get loop | **Confirmed via decompile, not hardware-tested.** Codes and layouts from `_VENC_SysInit`/`_QueryChnMem`/`_CreateChn`/`_SetRCAttr`/`_StartRecvPic`/`_HandleStream`/`_ReleaseStream`, called directly instead of through ipcam's per-channel vtable. See `sdk/headers/VENC_PROTOCOL_V201.md`. Two deviations: buffers come from one `vmm_alloc()` each instead of `isp_core`'s shared pool (`buffer_malloc_withname`), and each stream pack is assumed to be one complete NAL unit — an inference, since `FH_VENC_GetStream` has no caller in this binary to check against. Reading pack bytes via `/dev/mem` mmap is this code's own addition. |
-| Second channel (stream2, 800x576) | **Confirmed via decompile.** `FH_VPSS_ChnInitMem`/`SetChnAttr`/`SetVOMode` are channel-indexed (`< 5`); `FH_VPSS_SysInitMem` loops size/alloc/addr per channel; `FH_VPSS_OpenChn`/`Enable` take no channel and run once. |
-| RTSP/RTP server (`rtsp_server.c`) | **From spec, not decompiled.** RFC 2326/3550/6184: two H.264 streams, UDP and TCP-interleaved, RTCP SR, optional Basic auth (`MINI_STREAMER_RTSP_USER`/`PASS`). |
+| Second channel (stream=1, 800x576) | **Confirmed via decompile.** `FH_VPSS_ChnInitMem`/`SetChnAttr`/`SetVOMode` are channel-indexed (`< 5`); `FH_VPSS_SysInitMem` loops size/alloc/addr per channel; `FH_VPSS_OpenChn`/`Enable` take no channel and run once. |
+| RTSP/RTP server (`rtsp_server.c`) | **Byte-matched to majestic.** Cloned from real OpenIPC majestic (master+2a2e35c, 2026-10-16) run under QEMU by `tools/majestic-oracle`; `tools/majestic-oracle/test.sh` replays the same clip through `rtsp_server.c` and diffs every RTSP reply and RTP/RTCP packet against `fixtures/majestic.json`. One gap: RTP timestamps use frame-retrieval time because the V201 GetStream struct's PTS field is not identified yet. Optional Basic auth via `MINI_STREAMER_RTSP_USER`/`PASS`; majestic checks the system password instead. |
 
 ### Usage
 
@@ -231,6 +231,27 @@ the clean-room libraries in `sdk/lib/`. Read this before trusting any one part.
 echo V > /dev/watchdog   # magic close, disables watchdog
 killall ipcam
 ./mini_streamer
-ffplay rtsp://<device-ip>:554/stream1   # main, 1920x1080 (also raw H.264 on stdout)
-ffplay rtsp://<device-ip>:554/stream2   # sub, 800x576
+ffplay rtsp://<device-ip>:554/stream=0   # main, 1920x1080 (also raw H.264 on stdout)
+ffplay rtsp://<device-ip>:554/stream=1   # sub, 800x576
 ```
+
+### Majestic's RTSP behaviour (from `tools/majestic-oracle`)
+
+Majestic's Fullhan port has no video path: its only SDK imports are `FH_SYS_BindVpu2Enc`,
+`FH_VENC_CreateChn`/`SetChnAttr`/`GetStream_Block`/`ReleaseStream`/`RequestIDR` and
+`FHAdv_Isp_SetColorMode`, used for a JPEG snapshot channel only. Its RTSP server is
+platform-independent, so the oracle runs the Goke build of the same commit with a fake MPI
+library (`fake_mpi.c`) that feeds `fixtures/input_1080p25_gop50.h264`. What it showed:
+
+- `Server: OpenIPC.org RTSP Server/0.1`; `Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER`
+- Basic auth, realm `WallyWorld`, skipped for loopback peers; `401 Authentication required` without credentials, `401 Invalid credentials` with wrong ones
+- DESCRIBE on any path serves stream 0; SETUP of a missing stream is `404 Stream not found`; SDP carries an ONVIF metadata track (PT 107)
+- Session ids are random positive 31-bit decimals, `;timeout=60`; PLAY answers `Range: npt=now-` with no RTP-Info
+- A session starts at the next SPS sent in-band; cached SPS/PPS are never injected; SEI NALs are dropped
+- 1200-byte RTP payloads, FU-A for larger NALs, marker on a frame's last packet, sequence from 0, random SSRC per track
+- RTP timestamp = encoder PTS (µs) × 9 / 100 + a random per-process base
+- No RTCP sender reports; TEARDOWN sends a BYE "session ended" per track (video first)
+- Metadata track: one ONVIF `MetadataStream` per second, empty 22×18 motion grid (`zwA=`), wall-clock timestamps
+
+Regenerate the fixture with `tools/majestic-oracle/build.sh && tools/majestic-oracle/run.sh`, then
+`docker run --rm --network container:majestic-oracle -v $PWD/tools/majestic-oracle:/w python:3.12-slim python3 /w/capture.py /w/fixtures/majestic.json`.

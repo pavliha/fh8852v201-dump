@@ -1,559 +1,584 @@
-/**
- * Minimal RTSP/RTP server for mini_streamer.c.
- *
- * Implemented directly from RFC 2326 (RTSP) and RFC 6184 (H.264 over RTP) —
- * public IETF specs, not decompiled from any vendor binary. There is no
- * vendor code to clean-room against here: majestic's own RTSP server, and
- * ipcam's rtsp-prefixed/m_rtsp-prefixed/zrtsp-prefixed functions, were
- * deliberately not consulted for protocol logic (see README's decompiled-
- * function tables for their existence, not their implementation).
- *
- * Scope: two video streams (stream1 = main, stream2 = sub), H.264 only,
- * up to RTSP_MAX_CLIENTS simultaneous viewers, optional RTSP Basic auth,
- * RTCP Sender Reports (send-only, once/sec per client — see
- * rtsp_server_send_rtcp_sr(), RFC 3550 6.4.1), and both UDP and
- * TCP-interleaved transport (RFC 2326 S10.12 — a client requesting
- * "RTP/AVP/TCP" in SETUP's Transport header gets its RTP/RTCP framed as
- * '$'+channel+length directly on the RTSP TCP connection, no UDP sockets
- * involved). No RTCP feedback parsing (nothing reads the client's own
- * RTCP packets), no audio track. OPTIONS/DESCRIBE/SETUP/PLAY/TEARDOWN/
- * GET_PARAMETER only.
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <stdint.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <time.h>
 #include <sys/socket.h>
-#include <sys/time.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 
 #include "rtsp_server.h"
 
-static const char b64_tab[] =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+#define SERVER_NAME "OpenIPC.org RTSP Server/0.1"
+#define AUTH_REALM "WallyWorld"
+#define RTP_MAX_PAYLOAD 1200
+#define FU_A_DATA (RTP_MAX_PAYLOAD - 2)
+#define PT_H264 96
+#define PT_METADATA 107
+#define METADATA_INTERVAL_US 1000000u
+#define NAL_SEI 6
+#define NAL_SPS 7
+#define NAL_PPS 8
+#define NAL_FU_A 28
 
-static size_t base64_encode(const uint8_t *in, size_t in_len, char *out, size_t out_cap)
+static const char b64_tab[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static uint64_t now_us(void)
 {
-    size_t oi = 0, i = 0;
-    for (; i + 3 <= in_len && oi + 4 < out_cap; i += 3) {
-        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8) | in[i + 2];
-        out[oi++] = b64_tab[(v >> 18) & 0x3F];
-        out[oi++] = b64_tab[(v >> 12) & 0x3F];
-        out[oi++] = b64_tab[(v >> 6) & 0x3F];
-        out[oi++] = b64_tab[v & 0x3F];
-    }
-    size_t rem = in_len - i;
-    if (rem == 1 && oi + 4 < out_cap) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static uint32_t random_u32(void)
+{
+    return ((uint32_t)random() << 16) ^ (uint32_t)random();
+}
+
+static void base64_encode(const uint8_t *in, size_t len, char *out)
+{
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 3) {
         uint32_t v = (uint32_t)in[i] << 16;
-        out[oi++] = b64_tab[(v >> 18) & 0x3F];
-        out[oi++] = b64_tab[(v >> 12) & 0x3F];
-        out[oi++] = '=';
-        out[oi++] = '=';
-    } else if (rem == 2 && oi + 4 < out_cap) {
-        uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i + 1] << 8);
-        out[oi++] = b64_tab[(v >> 18) & 0x3F];
-        out[oi++] = b64_tab[(v >> 12) & 0x3F];
-        out[oi++] = b64_tab[(v >> 6) & 0x3F];
-        out[oi++] = '=';
+        if (i + 1 < len) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < len) v |= in[i + 2];
+        out[o++] = b64_tab[(v >> 18) & 0x3f];
+        out[o++] = b64_tab[(v >> 12) & 0x3f];
+        out[o++] = i + 1 < len ? b64_tab[(v >> 6) & 0x3f] : '=';
+        out[o++] = i + 2 < len ? b64_tab[v & 0x3f] : '=';
     }
-    out[oi] = '\0';
-    return oi;
+    out[o] = '\0';
 }
 
 static int b64_val(char c)
 {
-    if (c >= 'A' && c <= 'Z') return c - 'A';
-    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
-    if (c >= '0' && c <= '9') return c - '0' + 52;
-    if (c == '+') return 62;
-    if (c == '/') return 63;
-    return -1;
+    const char *p = strchr(b64_tab, c);
+    return c && p ? (int)(p - b64_tab) : -1;
 }
 
-static size_t base64_decode(const char *in, char *out, size_t out_cap)
+static void base64_decode(const char *in, char *out, size_t cap)
 {
-    size_t oi = 0;
-    int vals[4];
-    int n = 0;
-    for (const char *p = in; *p && *p != '='; p++) {
-        int v = b64_val(*p);
-        if (v < 0) continue;
-        vals[n++] = v;
-        if (n == 4) {
-            if (oi + 3 < out_cap) {
-                out[oi++] = (char)((vals[0] << 2) | (vals[1] >> 4));
-                out[oi++] = (char)((vals[1] << 4) | (vals[2] >> 2));
-                out[oi++] = (char)((vals[2] << 6) | vals[3]);
-            }
-            n = 0;
+    size_t o = 0;
+    uint32_t acc = 0;
+    int bits = 0;
+    for (; *in && *in != '='; in++) {
+        int v = b64_val(*in);
+        if (v < 0)
+            continue;
+        acc = (acc << 6) | (uint32_t)v;
+        bits += 6;
+        if (bits >= 8 && o + 1 < cap) {
+            bits -= 8;
+            out[o++] = (char)((acc >> bits) & 0xff);
         }
     }
-    if (n >= 2 && oi + 1 < out_cap) out[oi++] = (char)((vals[0] << 2) | (vals[1] >> 4));
-    if (n >= 3 && oi + 1 < out_cap) out[oi++] = (char)((vals[1] << 4) | (vals[2] >> 2));
-    out[oi] = '\0';
-    return oi;
+    out[o] = '\0';
 }
 
-/* Exact-case match on the canonical RTSP header spelling ffplay/VLC send.
-   RTSP headers are formally case-insensitive; this is a scoped-down
-   simplification, not a protocol-complete parser. */
-static int header_value(const char *req, const char *name, char *out, size_t out_cap)
+static int header_value(const char *req, const char *name, char *out, size_t cap)
 {
-    size_t name_len = strlen(name);
-    const char *p = req;
-    while ((p = strstr(p, name)) != NULL) {
-        if (p == req || p[-1] == '\n') {
-            const char *v = p + name_len;
-            while (*v == ' ' || *v == ':') v++;
-            size_t i = 0;
-            while (*v && *v != '\r' && *v != '\n' && i + 1 < out_cap) out[i++] = *v++;
-            out[i] = '\0';
-            return 1;
-        }
-        p++;
+    size_t n = strlen(name);
+    for (const char *line = strstr(req, "\r\n"); line; line = strstr(line + 2, "\r\n")) {
+        const char *p = line + 2;
+        if (strncasecmp(p, name, n) != 0 || p[n] != ':')
+            continue;
+        p += n + 1;
+        while (*p == ' ')
+            p++;
+        size_t i = 0;
+        while (*p && *p != '\r' && i + 1 < cap)
+            out[i++] = *p++;
+        out[i] = '\0';
+        return 1;
     }
     return 0;
 }
 
-/* Which stream a request's URI refers to: anything mentioning "stream2"
-   is the sub stream (index 1), everything else defaults to stream1. */
-static int parse_stream_id(const char *req)
+static void send_all(int fd, const void *data, size_t len)
 {
-    char uri[256] = {0};
-    sscanf(req, "%*s %255s", uri);
-    return strstr(uri, "stream2") != NULL ? 1 : 0;
+    const uint8_t *p = data;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR)
+                continue;
+            return;
+        }
+        p += n;
+        len -= (size_t)n;
+    }
 }
 
-static int check_auth(rtsp_server_t *srv, const char *req)
+static void reply(rtsp_client_t *c, const char *cseq, const char *status, const char *extra)
 {
-    if (!srv->auth_enabled) return 1;
-    char auth[256] = {0};
-    if (!header_value(req, "Authorization", auth, sizeof(auth))) return 0;
-    char *b64 = strstr(auth, "Basic ");
-    if (!b64) return 0;
-    b64 += strlen("Basic ");
-    char decoded[128] = {0};
-    base64_decode(b64, decoded, sizeof(decoded));
-    char expected[64];
-    snprintf(expected, sizeof(expected), "%s:%s", srv->auth_user, srv->auth_pass);
-    return strcmp(decoded, expected) == 0;
+    char buf[512];
+    int n = snprintf(buf, sizeof(buf), "RTSP/1.0 %s\r\nCSeq: %s\r\nServer: " SERVER_NAME "\r\n%s\r\n",
+                     status, cseq, extra ? extra : "");
+    send_all(c->tcp_fd, buf, (size_t)n);
 }
 
-static void rtsp_client_reset(rtsp_client_t *c)
+static void track_close(rtsp_track_t *t)
 {
-    if (c->tcp_fd >= 0) close(c->tcp_fd);
-    if (c->rtp_fd >= 0) close(c->rtp_fd);
-    if (c->rtcp_fd >= 0) close(c->rtcp_fd);
+    if (t->rtp_fd >= 0)
+        close(t->rtp_fd);
+    if (t->rtcp_fd >= 0)
+        close(t->rtcp_fd);
+    memset(t, 0, sizeof(*t));
+    t->rtp_fd = -1;
+    t->rtcp_fd = -1;
+}
+
+static void session_reset(rtsp_client_t *c)
+{
+    for (int i = 0; i < RTSP_TRACK_COUNT; i++)
+        track_close(&c->tracks[i]);
+    c->has_session = 0;
+    c->playing = 0;
+    c->waiting_for_sps = 0;
+}
+
+static void client_init(rtsp_client_t *c)
+{
     memset(c, 0, sizeof(*c));
     c->tcp_fd = -1;
-    c->rtp_fd = -1;
-    c->rtcp_fd = -1;
+    for (int i = 0; i < RTSP_TRACK_COUNT; i++) {
+        c->tracks[i].rtp_fd = -1;
+        c->tracks[i].rtcp_fd = -1;
+    }
+}
+
+static void client_reset(rtsp_client_t *c)
+{
+    session_reset(c);
+    if (c->tcp_fd >= 0)
+        close(c->tcp_fd);
+    client_init(c);
+}
+
+static void track_send(rtsp_client_t *c, rtsp_track_t *t, int rtcp, const uint8_t *data, size_t len)
+{
+    if (t->interleaved) {
+        uint8_t frame[4 + 12 + RTP_MAX_PAYLOAD];
+        if (len > sizeof(frame) - 4)
+            return;
+        frame[0] = '$';
+        frame[1] = rtcp ? t->rtcp_channel : t->rtp_channel;
+        frame[2] = (uint8_t)(len >> 8);
+        frame[3] = (uint8_t)len;
+        memcpy(frame + 4, data, len);
+        send_all(c->tcp_fd, frame, len + 4);
+        return;
+    }
+    if (rtcp)
+        sendto(t->rtcp_fd, data, len, 0, (struct sockaddr *)&t->rtcp_addr, sizeof(t->rtcp_addr));
+    else
+        sendto(t->rtp_fd, data, len, 0, (struct sockaddr *)&t->rtp_addr, sizeof(t->rtp_addr));
+}
+
+static void rtp_send(rtsp_client_t *c, rtsp_track_t *t, uint8_t pt, int marker, uint32_t ts,
+                     const uint8_t *prefix, size_t prefix_len, const uint8_t *payload, size_t len)
+{
+    uint8_t pkt[12 + RTP_MAX_PAYLOAD];
+    pkt[0] = 0x80;
+    pkt[1] = (uint8_t)((marker ? 0x80 : 0) | pt);
+    pkt[2] = (uint8_t)(t->seq >> 8);
+    pkt[3] = (uint8_t)t->seq;
+    pkt[4] = (uint8_t)(ts >> 24);
+    pkt[5] = (uint8_t)(ts >> 16);
+    pkt[6] = (uint8_t)(ts >> 8);
+    pkt[7] = (uint8_t)ts;
+    pkt[8] = (uint8_t)(t->ssrc >> 24);
+    pkt[9] = (uint8_t)(t->ssrc >> 16);
+    pkt[10] = (uint8_t)(t->ssrc >> 8);
+    pkt[11] = (uint8_t)t->ssrc;
+    if (prefix_len)
+        memcpy(pkt + 12, prefix, prefix_len);
+    memcpy(pkt + 12 + prefix_len, payload, len);
+    t->seq++;
+    track_send(c, t, 0, pkt, 12 + prefix_len + len);
+}
+
+static void send_bye(rtsp_client_t *c, rtsp_track_t *t)
+{
+    static const char reason[] = "session ended";
+    uint8_t pkt[24] = {0x81, 0xcb, 0x00, 0x05};
+    pkt[4] = (uint8_t)(t->ssrc >> 24);
+    pkt[5] = (uint8_t)(t->ssrc >> 16);
+    pkt[6] = (uint8_t)(t->ssrc >> 8);
+    pkt[7] = (uint8_t)t->ssrc;
+    pkt[8] = (uint8_t)(sizeof(reason) - 1);
+    memcpy(pkt + 9, reason, sizeof(reason) - 1);
+    track_send(c, t, 1, pkt, sizeof(pkt));
+}
+
+static void send_metadata(rtsp_server_t *srv, rtsp_client_t *c)
+{
+    char utc[32];
+    char xml[512];
+    time_t now = time(NULL);
+    struct tm tm;
+    gmtime_r(&now, &tm);
+    strftime(utc, sizeof(utc), "%Y-%m-%dT%H:%M:%SZ", &tm);
+    int n = snprintf(xml, sizeof(xml),
+                     "<tt:MetadataStream xmlns:tt=\"http://www.onvif.org/ver10/schema\"><tt:VideoAnalytics>"
+                     "<tt:Frame UtcTime=\"%s\"><tt:Extension><tt:MotionInCells Columns=\"22\" Rows=\"18\" "
+                     "Cells=\"zwA=\"/></tt:Extension></tt:Frame></tt:VideoAnalytics></tt:MetadataStream>",
+                     utc);
+    uint32_t ts = srv->metadata_ts_base + (uint32_t)(now_us() * 9u / 100u);
+    rtp_send(c, &c->tracks[RTSP_TRACK_METADATA], PT_METADATA, 1, ts, NULL, 0, (const uint8_t *)xml, (size_t)n);
+}
+
+static int bind_udp_pair(rtsp_track_t *t)
+{
+    for (int attempt = 0; attempt < 16; attempt++) {
+        int rtp = socket(AF_INET, SOCK_DGRAM, 0);
+        int rtcp = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_ANY)};
+        socklen_t al = sizeof(a);
+        if (rtp >= 0 && rtcp >= 0 && bind(rtp, (struct sockaddr *)&a, sizeof(a)) == 0 &&
+            getsockname(rtp, (struct sockaddr *)&a, &al) == 0) {
+            a.sin_port = htons((uint16_t)(ntohs(a.sin_port) + 1));
+            if (bind(rtcp, (struct sockaddr *)&a, sizeof(a)) == 0) {
+                t->rtp_fd = rtp;
+                t->rtcp_fd = rtcp;
+                return ntohs(a.sin_port) - 1;
+            }
+        }
+        if (rtp >= 0)
+            close(rtp);
+        if (rtcp >= 0)
+            close(rtcp);
+    }
+    return -1;
+}
+
+static int stream_of(const char *uri)
+{
+    const char *p = strstr(uri, "stream=");
+    return p ? atoi(p + strlen("stream=")) : 0;
+}
+
+static int ends_with(const char *s, const char *suffix)
+{
+    size_t n = strlen(s), m = strlen(suffix);
+    return n >= m && strcmp(s + n - m, suffix) == 0;
+}
+
+static int auth_ok(rtsp_server_t *srv, rtsp_client_t *c, const char *req, const char *cseq)
+{
+    if (!srv->auth_enabled || c->loopback)
+        return 1;
+    char auth[256];
+    const char *challenge = "WWW-Authenticate: Basic realm=\"" AUTH_REALM "\"\r\n";
+    if (!header_value(req, "Authorization", auth, sizeof(auth))) {
+        reply(c, cseq, "401 Authentication required", challenge);
+        return 0;
+    }
+    char decoded[128] = {0};
+    char expected[80];
+    snprintf(expected, sizeof(expected), "%s:%s", srv->auth_user, srv->auth_pass);
+    if (strncmp(auth, "Basic ", 6) == 0)
+        base64_decode(auth + 6, decoded, sizeof(decoded));
+    if (strcmp(decoded, expected) != 0) {
+        reply(c, cseq, "401 Invalid credentials", challenge);
+        return 0;
+    }
+    return 1;
+}
+
+static int session_ok(rtsp_client_t *c, const char *req, const char *cseq)
+{
+    char value[64];
+    if (!header_value(req, "Session", value, sizeof(value))) {
+        reply(c, cseq, "400 Failed to parse `Session'", NULL);
+        return 0;
+    }
+    if (!c->has_session || strtoul(value, NULL, 10) != c->session_id) {
+        reply(c, cseq, "454 Session ID is invalid", NULL);
+        return 0;
+    }
+    return 1;
+}
+
+static int handle_describe(rtsp_server_t *srv, rtsp_client_t *c, const char *uri, const char *cseq)
+{
+    int s = stream_of(uri);
+    if (s < 0 || s >= RTSP_STREAM_COUNT || !srv->stream_enabled[s])
+        s = 0;
+    if (!srv->sps_len[s] || !srv->pps_len[s])
+        return 0;
+    char sps64[192], pps64[192], sdp[1024], head[512];
+    base64_encode(srv->sps[s], srv->sps_len[s], sps64);
+    base64_encode(srv->pps[s], srv->pps_len[s], pps64);
+    int sdp_len = snprintf(sdp, sizeof(sdp),
+                           "v=0\r\no=OpenIPC 0 0 IN IP4 0.0.0.0\r\ns=Majestic\r\nc=IN IP4 0.0.0.0\r\nt=0 0\r\n"
+                           "m=video 0 RTP/AVP 96\r\na=control:video\r\na=rtpmap:96 H264/90000\r\n"
+                           "a=fmtp:96 profile-level-id=%02x%02x%02x;packetization-mode=1;sprop-parameter-sets=%s,%s\r\n"
+                           "a=framerate:%u\r\n"
+                           "m=application 0 RTP/AVP 107\r\na=rtpmap:107 vnd.onvif.metadata/90000\r\na=control:metadata\r\n",
+                           srv->sps[s][1], srv->sps[s][2], srv->sps[s][3], sps64, pps64, srv->fps[s]);
+    int head_len = snprintf(head, sizeof(head),
+                            "RTSP/1.0 200 OK\r\nCSeq: %s\r\nContent-Length: %d\r\nServer: " SERVER_NAME
+                            "\r\nContent-Base: %s\r\nContent-Type: application/sdp\r\n\r\n",
+                            cseq, sdp_len, uri);
+    send_all(c->tcp_fd, head, (size_t)head_len);
+    send_all(c->tcp_fd, sdp, (size_t)sdp_len);
+    return 1;
+}
+
+static void handle_setup(rtsp_server_t *srv, rtsp_client_t *c, const char *req, const char *uri, const char *cseq)
+{
+    int s = stream_of(uri);
+    if (s < 0 || s >= RTSP_STREAM_COUNT || !srv->stream_enabled[s]) {
+        reply(c, cseq, "404 Stream not found", NULL);
+        return;
+    }
+    char transport[256] = {0};
+    header_value(req, "Transport", transport, sizeof(transport));
+    rtsp_track_t *t = &c->tracks[ends_with(uri, "metadata") ? RTSP_TRACK_METADATA : RTSP_TRACK_VIDEO];
+    char reply_transport[160];
+    unsigned a = 0, b = 0;
+    if (strstr(transport, "TCP")) {
+        const char *p = strstr(transport, "interleaved=");
+        if (!p) {
+            reply(c, cseq, "400 `interleaved' not found", NULL);
+            return;
+        }
+        if (sscanf(p, "interleaved=%u-%u", &a, &b) < 2)
+            b = a + 1;
+        track_close(t);
+        t->interleaved = 1;
+        t->rtp_channel = (uint8_t)a;
+        t->rtcp_channel = (uint8_t)b;
+        snprintf(reply_transport, sizeof(reply_transport), "RTP/AVP/TCP;unicast;interleaved=%u-%u", a, b);
+    } else {
+        const char *p = strstr(transport, "client_port=");
+        if (!p) {
+            reply(c, cseq, "400 `client_port' not found", NULL);
+            return;
+        }
+        if (sscanf(p, "client_port=%u-%u", &a, &b) < 2)
+            b = a + 1;
+        track_close(t);
+        int port = bind_udp_pair(t);
+        if (port < 0) {
+            reply(c, cseq, "500 Internal Server Error", NULL);
+            return;
+        }
+        struct sockaddr_in peer;
+        socklen_t pl = sizeof(peer);
+        getpeername(c->tcp_fd, (struct sockaddr *)&peer, &pl);
+        t->rtp_addr = peer;
+        t->rtp_addr.sin_port = htons((uint16_t)a);
+        t->rtcp_addr = peer;
+        t->rtcp_addr.sin_port = htons((uint16_t)b);
+        snprintf(reply_transport, sizeof(reply_transport),
+                 "RTP/AVP/UDP;unicast;client_port=%u-%u;server_port=%d-%d", a, b, port, port + 1);
+    }
+    t->active = 1;
+    t->ssrc = random_u32();
+    t->seq = 0;
+    c->stream_id = s;
+    if (!c->has_session) {
+        c->has_session = 1;
+        c->session_id = (uint32_t)random() & 0x7fffffffu;
+    }
+    char extra[256];
+    snprintf(extra, sizeof(extra), "Transport: %s\r\nSession: %u;timeout=60\r\n", reply_transport, c->session_id);
+    reply(c, cseq, "200 OK", extra);
+}
+
+static int handle_request(rtsp_server_t *srv, rtsp_client_t *c, const char *req)
+{
+    char method[32] = {0}, uri[256] = {0}, cseq[32] = {0};
+    sscanf(req, "%31s %255s", method, uri);
+    header_value(req, "CSeq", cseq, sizeof(cseq));
+    if (!auth_ok(srv, c, req, cseq))
+        return 1;
+    if (strcmp(method, "OPTIONS") == 0) {
+        reply(c, cseq, "200 OK", "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n");
+    } else if (strcmp(method, "DESCRIBE") == 0) {
+        return handle_describe(srv, c, uri, cseq);
+    } else if (strcmp(method, "SETUP") == 0) {
+        handle_setup(srv, c, req, uri, cseq);
+    } else if (strcmp(method, "PLAY") == 0) {
+        if (session_ok(c, req, cseq)) {
+            reply(c, cseq, "200 OK", "Range: npt=now-\r\n");
+            c->playing = 1;
+            c->waiting_for_sps = 1;
+            c->next_metadata_us = now_us();
+        }
+    } else if (strcmp(method, "GET_PARAMETER") == 0) {
+        reply(c, cseq, "200 OK", NULL);
+    } else if (strcmp(method, "TEARDOWN") == 0) {
+        if (session_ok(c, req, cseq)) {
+            for (int i = 0; i < RTSP_TRACK_COUNT; i++)
+                if (c->tracks[i].active)
+                    send_bye(c, &c->tracks[i]);
+            reply(c, cseq, "200 OK", NULL);
+            session_reset(c);
+        }
+    } else {
+        reply(c, cseq, "405 Unknown method", NULL);
+    }
+    return 1;
+}
+
+static void drain_requests(rtsp_server_t *srv, rtsp_client_t *c)
+{
+    for (;;) {
+        char *end = strstr(c->rxbuf, "\r\n\r\n");
+        if (!end)
+            return;
+        size_t req_len = (size_t)(end - c->rxbuf) + 4;
+        char req[sizeof(c->rxbuf)];
+        memcpy(req, c->rxbuf, req_len);
+        req[req_len] = '\0';
+        if (!handle_request(srv, c, req))
+            return;
+        memmove(c->rxbuf, c->rxbuf + req_len, c->rxlen - req_len + 1);
+        c->rxlen -= req_len;
+    }
 }
 
 int rtsp_server_init(rtsp_server_t *srv, uint16_t port)
 {
     memset(srv, 0, sizeof(*srv));
-    for (int i = 0; i < RTSP_MAX_CLIENTS; i++) {
-        srv->clients[i].tcp_fd = -1;
-        srv->clients[i].rtp_fd = -1;
-        srv->clients[i].rtcp_fd = -1;
-    }
-    srv->next_session_id = 1;
-
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    srandom((unsigned)(time(NULL) ^ (getpid() << 16) ^ now_us()));
+    for (int i = 0; i < RTSP_MAX_CLIENTS; i++)
+        client_init(&srv->clients[i]);
+    for (int s = 0; s < RTSP_STREAM_COUNT; s++)
+        srv->video_ts_base[s] = random_u32();
+    srv->metadata_ts_base = random_u32();
+    srv->listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv->listen_fd < 0)
+        return -1;
     int one = 1;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        close(fd);
+    setsockopt(srv->listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(INADDR_ANY)};
+    if (bind(srv->listen_fd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(srv->listen_fd, 8) < 0) {
+        close(srv->listen_fd);
         return -1;
     }
-    if (listen(fd, 8) < 0) {
-        close(fd);
-        return -1;
-    }
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    srv->listen_fd = fd;
+    fcntl(srv->listen_fd, F_SETFL, O_NONBLOCK);
     return 0;
 }
 
 void rtsp_server_set_credentials(rtsp_server_t *srv, const char *user, const char *pass)
 {
+    snprintf(srv->auth_user, sizeof(srv->auth_user), "%s", user);
+    snprintf(srv->auth_pass, sizeof(srv->auth_pass), "%s", pass);
     srv->auth_enabled = 1;
-    strncpy(srv->auth_user, user, sizeof(srv->auth_user) - 1);
-    strncpy(srv->auth_pass, pass, sizeof(srv->auth_pass) - 1);
 }
 
-static void rtsp_accept_new(rtsp_server_t *srv)
+void rtsp_server_enable_stream(rtsp_server_t *srv, int stream_id, unsigned fps)
 {
-    int fd = accept(srv->listen_fd, NULL, NULL);
-    if (fd < 0) return;
-
-    int slot = -1;
-    for (int i = 0; i < RTSP_MAX_CLIENTS; i++) {
-        if (srv->clients[i].tcp_fd < 0) {
-            slot = i;
-            break;
-        }
-    }
-    if (slot < 0) {
-        close(fd);
+    if (stream_id < 0 || stream_id >= RTSP_STREAM_COUNT)
         return;
-    }
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    rtsp_client_reset(&srv->clients[slot]);
-    srv->clients[slot].tcp_fd = fd;
-}
-
-static void rtsp_handle_request(rtsp_server_t *srv, rtsp_client_t *c, const char *req)
-{
-    char method[16] = {0};
-    sscanf(req, "%15s", method);
-
-    char cseq[32] = "0";
-    header_value(req, "CSeq", cseq, sizeof(cseq));
-
-    char resp[1024];
-    int resp_len;
-
-    int needs_auth = (strcmp(method, "DESCRIBE") == 0 || strcmp(method, "SETUP") == 0 ||
-                       strcmp(method, "PLAY") == 0);
-    if (needs_auth && !check_auth(srv, req)) {
-        resp_len = snprintf(resp, sizeof(resp),
-            "RTSP/1.0 401 Unauthorized\r\nCSeq: %s\r\n"
-            "WWW-Authenticate: Basic realm=\"mini_streamer\"\r\n\r\n", cseq);
-        send(c->tcp_fd, resp, (size_t)resp_len, 0);
-        return;
-    }
-
-    if (strcmp(method, "OPTIONS") == 0) {
-        resp_len = snprintf(resp, sizeof(resp),
-            "RTSP/1.0 200 OK\r\nCSeq: %s\r\n"
-            "Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER\r\n\r\n",
-            cseq);
-    } else if (strcmp(method, "DESCRIBE") == 0) {
-        int sid = parse_stream_id(req);
-        char sps_b64[128] = {0}, pps_b64[128] = {0};
-        base64_encode(srv->sps[sid], srv->sps_len[sid], sps_b64, sizeof(sps_b64));
-        base64_encode(srv->pps[sid], srv->pps_len[sid], pps_b64, sizeof(pps_b64));
-        char sdp[768];
-        int sdp_len = snprintf(sdp, sizeof(sdp),
-            "v=0\r\n"
-            "o=- 0 0 IN IP4 0.0.0.0\r\n"
-            "s=mini_streamer\r\n"
-            "c=IN IP4 0.0.0.0\r\n"
-            "t=0 0\r\n"
-            "a=tool:mini_streamer\r\n"
-            "m=video 0 RTP/AVP 96\r\n"
-            "a=rtpmap:96 H264/90000\r\n"
-            "a=fmtp:96 packetization-mode=1;profile-level-id=%02x%02x%02x;"
-            "sprop-parameter-sets=%s,%s\r\n"
-            "a=control:stream%d\r\n",
-            srv->sps_len[sid] > 3 ? srv->sps[sid][1] : 0,
-            srv->sps_len[sid] > 3 ? srv->sps[sid][2] : 0,
-            srv->sps_len[sid] > 3 ? srv->sps[sid][3] : 0,
-            sps_b64, pps_b64, sid + 1);
-        resp_len = snprintf(resp, sizeof(resp),
-            "RTSP/1.0 200 OK\r\nCSeq: %s\r\n"
-            "Content-Base: rtsp://0.0.0.0:554/stream%d/\r\n"
-            "Content-Type: application/sdp\r\nContent-Length: %d\r\n\r\n%s",
-            cseq, sid + 1, sdp_len, sdp);
-    } else if (strcmp(method, "SETUP") == 0) {
-        char transport[256] = {0};
-        header_value(req, "Transport", transport, sizeof(transport));
-
-        if (strstr(transport, "RTP/AVP/TCP") != NULL) {
-            /* RFC 2326 S10.12: media rides the same TCP connection as RTSP,
-               each packet prefixed with '$', a channel byte, and a 2-byte
-               big-endian length. No separate UDP sockets needed. */
-            int rtp_ch = 0, rtcp_ch = 1;
-            char *ip = strstr(transport, "interleaved=");
-            if (ip) sscanf(ip + strlen("interleaved="), "%d-%d", &rtp_ch, &rtcp_ch);
-
-            c->interleaved = 1;
-            c->rtp_channel = (uint8_t)rtp_ch;
-            c->rtcp_channel = (uint8_t)rtcp_ch;
-            c->session_id = srv->next_session_id++;
-            c->seq = 0;
-            c->ssrc = 0x4D494E49u + c->session_id;
-            c->playing = 0;
-            c->stream_id = parse_stream_id(req);
-
-            resp_len = snprintf(resp, sizeof(resp),
-                "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: %u\r\n"
-                "Transport: RTP/AVP/TCP;unicast;interleaved=%d-%d\r\n\r\n",
-                cseq, c->session_id, rtp_ch, rtcp_ch);
-            send(c->tcp_fd, resp, (size_t)resp_len, 0);
-            return;
-        }
-
-        int cport1 = 0, cport2 = 0;
-        char *cp = strstr(transport, "client_port=");
-        if (cp) sscanf(cp + strlen("client_port="), "%d-%d", &cport1, &cport2);
-
-        if (cport1 <= 0) {
-            resp_len = snprintf(resp, sizeof(resp),
-                "RTSP/1.0 461 Unsupported Transport\r\nCSeq: %s\r\n\r\n", cseq);
-        } else {
-            struct sockaddr_in peer;
-            socklen_t plen = sizeof(peer);
-            getpeername(c->tcp_fd, (struct sockaddr *)&peer, &plen);
-            c->rtp_addr = peer;
-            c->rtp_addr.sin_port = htons((uint16_t)cport1);
-            c->rtcp_addr = peer;
-            c->rtcp_addr.sin_port = htons((uint16_t)(cport2 > 0 ? cport2 : cport1 + 1));
-
-            c->rtp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-            c->rtcp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-            struct sockaddr_in local;
-            memset(&local, 0, sizeof(local));
-            local.sin_family = AF_INET;
-            local.sin_addr.s_addr = INADDR_ANY;
-
-            if (c->rtp_fd < 0 || c->rtcp_fd < 0 ||
-                bind(c->rtp_fd, (struct sockaddr *)&local, sizeof(local)) < 0 ||
-                bind(c->rtcp_fd, (struct sockaddr *)&local, sizeof(local)) < 0) {
-                if (c->rtp_fd >= 0) { close(c->rtp_fd); c->rtp_fd = -1; }
-                if (c->rtcp_fd >= 0) { close(c->rtcp_fd); c->rtcp_fd = -1; }
-                resp_len = snprintf(resp, sizeof(resp),
-                    "RTSP/1.0 500 Internal Server Error\r\nCSeq: %s\r\n\r\n", cseq);
-                send(c->tcp_fd, resp, (size_t)resp_len, 0);
-                return;
-            }
-
-            socklen_t llen = sizeof(local);
-            getsockname(c->rtp_fd, (struct sockaddr *)&local, &llen);
-            uint16_t server_rtp_port = ntohs(local.sin_port);
-            getsockname(c->rtcp_fd, (struct sockaddr *)&local, &llen);
-            uint16_t server_rtcp_port = ntohs(local.sin_port);
-
-            c->session_id = srv->next_session_id++;
-            c->seq = 0;
-            c->ssrc = 0x4D494E49u + c->session_id; /* "MINI" + session id */
-            c->playing = 0;
-            c->stream_id = parse_stream_id(req);
-            c->interleaved = 0;
-
-            resp_len = snprintf(resp, sizeof(resp),
-                "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: %u\r\n"
-                "Transport: RTP/AVP;unicast;client_port=%d-%d;server_port=%u-%u;ssrc=%08X\r\n\r\n",
-                cseq, c->session_id, cport1, cport2, server_rtp_port, server_rtcp_port, c->ssrc);
-        }
-    } else if (strcmp(method, "PLAY") == 0) {
-        c->playing = (c->rtp_fd >= 0);
-        resp_len = snprintf(resp, sizeof(resp),
-            "RTSP/1.0 200 OK\r\nCSeq: %s\r\nSession: %u\r\nRange: npt=0.000-\r\n\r\n",
-            cseq, c->session_id);
-    } else if (strcmp(method, "TEARDOWN") == 0) {
-        resp_len = snprintf(resp, sizeof(resp), "RTSP/1.0 200 OK\r\nCSeq: %s\r\n\r\n", cseq);
-        send(c->tcp_fd, resp, (size_t)resp_len, 0);
-        rtsp_client_reset(c);
-        return;
-    } else if (strcmp(method, "GET_PARAMETER") == 0) {
-        resp_len = snprintf(resp, sizeof(resp), "RTSP/1.0 200 OK\r\nCSeq: %s\r\n\r\n", cseq);
-    } else {
-        resp_len = snprintf(resp, sizeof(resp), "RTSP/1.0 501 Not Implemented\r\nCSeq: %s\r\n\r\n", cseq);
-    }
-    send(c->tcp_fd, resp, (size_t)resp_len, 0);
-}
-
-static void rtsp_service_client(rtsp_server_t *srv, int idx)
-{
-    rtsp_client_t *c = &srv->clients[idx];
-    char tmp[1024];
-    ssize_t n = recv(c->tcp_fd, tmp, sizeof(tmp) - 1, MSG_DONTWAIT);
-    if (n == 0) {
-        rtsp_client_reset(c);
-        return;
-    }
-    if (n < 0) return; /* EAGAIN or transient error; TEARDOWN/reset handles real disconnects */
-
-    if (c->rxlen + (size_t)n >= sizeof(c->rxbuf)) {
-        c->rxlen = 0; /* overflow guard: drop and resync on the next request */
-        return;
-    }
-    memcpy(c->rxbuf + c->rxlen, tmp, (size_t)n);
-    c->rxlen += (size_t)n;
-    c->rxbuf[c->rxlen] = '\0';
-
-    if (strstr(c->rxbuf, "\r\n\r\n") == NULL) return;
-    rtsp_handle_request(srv, c, c->rxbuf);
-    c->rxlen = 0;
+    srv->stream_enabled[stream_id] = 1;
+    srv->fps[stream_id] = fps;
 }
 
 void rtsp_server_poll(rtsp_server_t *srv)
 {
-    rtsp_accept_new(srv);
-    for (int i = 0; i < RTSP_MAX_CLIENTS; i++) {
-        if (srv->clients[i].tcp_fd >= 0) rtsp_service_client(srv, i);
-    }
-}
-
-void rtsp_server_set_param_set(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len)
-{
-    if (nal_len == 0 || stream_id < 0 || stream_id >= RTSP_STREAM_COUNT) return;
-    int type = nal[0] & 0x1F;
-    if (type == 7 && nal_len <= sizeof(srv->sps[stream_id])) {
-        memcpy(srv->sps[stream_id], nal, nal_len);
-        srv->sps_len[stream_id] = nal_len;
-    } else if (type == 8 && nal_len <= sizeof(srv->pps[stream_id])) {
-        memcpy(srv->pps[stream_id], nal, nal_len);
-        srv->pps_len[stream_id] = nal_len;
-    }
-}
-
-#define RTP_MTU_PAYLOAD 1400
-
-/*
- * RFC 2326 S10.12 interleaved framing: '$', channel byte, 2-byte
- * big-endian length, then the raw RTP/RTCP packet — all on the same
- * TCP connection the RTSP control traffic uses.
- */
-static void send_interleaved(int tcp_fd, uint8_t channel, const uint8_t *data, size_t len)
-{
-    uint8_t hdr[4];
-    hdr[0] = '$';
-    hdr[1] = channel;
-    hdr[2] = (uint8_t)(len >> 8);
-    hdr[3] = (uint8_t)len;
-    send(tcp_fd, hdr, sizeof(hdr), 0);
-    send(tcp_fd, data, len, 0);
-}
-
-static void rtp_send_packet(rtsp_client_t *c, const uint8_t *payload, size_t len,
-                             uint32_t ts, int marker)
-{
-    uint8_t pkt[12 + RTP_MTU_PAYLOAD];
-    if (len > sizeof(pkt) - 12) len = sizeof(pkt) - 12;
-
-    pkt[0] = 0x80;
-    pkt[1] = (uint8_t)((marker ? 0x80 : 0x00) | 96);
-    pkt[2] = (uint8_t)(c->seq >> 8);
-    pkt[3] = (uint8_t)c->seq;
-    pkt[4] = (uint8_t)(ts >> 24);
-    pkt[5] = (uint8_t)(ts >> 16);
-    pkt[6] = (uint8_t)(ts >> 8);
-    pkt[7] = (uint8_t)ts;
-    pkt[8] = (uint8_t)(c->ssrc >> 24);
-    pkt[9] = (uint8_t)(c->ssrc >> 16);
-    pkt[10] = (uint8_t)(c->ssrc >> 8);
-    pkt[11] = (uint8_t)c->ssrc;
-    memcpy(pkt + 12, payload, len);
-    c->seq++;
-    c->pkt_count++;
-    c->octet_count += (uint32_t)len;
-
-    if (c->interleaved) {
-        send_interleaved(c->tcp_fd, c->rtp_channel, pkt, 12 + len);
-    } else {
-        sendto(c->rtp_fd, pkt, 12 + len, 0, (struct sockaddr *)&c->rtp_addr, sizeof(c->rtp_addr));
-    }
-}
-
-/*
- * RTCP Sender Report (RFC 3550 6.4.1). No RTCP feedback is parsed back
- * from clients — this is send-only, enough for ffplay/VLC to show sync
- * and bitrate stats, which is what RTCP is for in a one-way media stream.
- */
-void rtsp_server_send_rtcp_sr(rtsp_server_t *srv, int stream_id, uint32_t rtp_ts)
-{
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    uint32_t ntp_sec = (uint32_t)tv.tv_sec + 2208988800u; /* Unix epoch -> NTP epoch */
-    uint32_t ntp_frac = (uint32_t)((double)tv.tv_usec * 4294967296.0 / 1000000.0);
-
-    for (int i = 0; i < RTSP_MAX_CLIENTS; i++) {
-        rtsp_client_t *c = &srv->clients[i];
-        if (c->tcp_fd < 0 || !c->playing || c->stream_id != stream_id) continue;
-        if (!c->interleaved && c->rtcp_fd < 0) continue;
-
-        uint8_t pkt[28];
-        pkt[0] = 0x80;
-        pkt[1] = 200; /* SR */
-        pkt[2] = 0;
-        pkt[3] = 6; /* (28/4)-1 */
-        pkt[4] = (uint8_t)(c->ssrc >> 24);
-        pkt[5] = (uint8_t)(c->ssrc >> 16);
-        pkt[6] = (uint8_t)(c->ssrc >> 8);
-        pkt[7] = (uint8_t)c->ssrc;
-        pkt[8] = (uint8_t)(ntp_sec >> 24);
-        pkt[9] = (uint8_t)(ntp_sec >> 16);
-        pkt[10] = (uint8_t)(ntp_sec >> 8);
-        pkt[11] = (uint8_t)ntp_sec;
-        pkt[12] = (uint8_t)(ntp_frac >> 24);
-        pkt[13] = (uint8_t)(ntp_frac >> 16);
-        pkt[14] = (uint8_t)(ntp_frac >> 8);
-        pkt[15] = (uint8_t)ntp_frac;
-        pkt[16] = (uint8_t)(rtp_ts >> 24);
-        pkt[17] = (uint8_t)(rtp_ts >> 16);
-        pkt[18] = (uint8_t)(rtp_ts >> 8);
-        pkt[19] = (uint8_t)rtp_ts;
-        pkt[20] = (uint8_t)(c->pkt_count >> 24);
-        pkt[21] = (uint8_t)(c->pkt_count >> 16);
-        pkt[22] = (uint8_t)(c->pkt_count >> 8);
-        pkt[23] = (uint8_t)c->pkt_count;
-        pkt[24] = (uint8_t)(c->octet_count >> 24);
-        pkt[25] = (uint8_t)(c->octet_count >> 16);
-        pkt[26] = (uint8_t)(c->octet_count >> 8);
-        pkt[27] = (uint8_t)c->octet_count;
-
-        if (c->interleaved) {
-            send_interleaved(c->tcp_fd, c->rtcp_channel, pkt, sizeof(pkt));
+    struct sockaddr_in peer;
+    socklen_t pl = sizeof(peer);
+    int fd = accept(srv->listen_fd, (struct sockaddr *)&peer, &pl);
+    if (fd >= 0) {
+        rtsp_client_t *slot = NULL;
+        for (int i = 0; i < RTSP_MAX_CLIENTS && !slot; i++)
+            if (srv->clients[i].tcp_fd < 0)
+                slot = &srv->clients[i];
+        if (!slot) {
+            close(fd);
         } else {
-            sendto(c->rtcp_fd, pkt, sizeof(pkt), 0,
-                   (struct sockaddr *)&c->rtcp_addr, sizeof(c->rtcp_addr));
+            client_reset(slot);
+            slot->tcp_fd = fd;
+            slot->loopback = (ntohl(peer.sin_addr.s_addr) >> 24) == 127;
+            fcntl(fd, F_SETFL, O_NONBLOCK);
         }
     }
-}
-
-void rtsp_server_send_nal(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len,
-                           uint32_t rtp_ts, int is_last_in_frame)
-{
-    if (nal_len == 0) return;
-
+    uint64_t now = now_us();
     for (int i = 0; i < RTSP_MAX_CLIENTS; i++) {
         rtsp_client_t *c = &srv->clients[i];
-        if (c->tcp_fd < 0 || !c->playing || c->rtp_fd < 0 || c->stream_id != stream_id) continue;
-
-        if (nal_len <= RTP_MTU_PAYLOAD) {
-            rtp_send_packet(c, nal, nal_len, rtp_ts, is_last_in_frame);
+        if (c->tcp_fd < 0)
+            continue;
+        ssize_t n = recv(c->tcp_fd, c->rxbuf + c->rxlen, sizeof(c->rxbuf) - 1 - c->rxlen, 0);
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            client_reset(c);
             continue;
         }
-
-        /* RFC 6184 FU-A fragmentation for NALs above one RTP payload. */
-        uint8_t nal_hdr = nal[0];
-        uint8_t nal_type = nal_hdr & 0x1F;
-        uint8_t nri = nal_hdr & 0x60;
-        size_t off = 1;
-        int first = 1;
-        while (off < nal_len) {
-            size_t chunk = nal_len - off;
-            if (chunk > RTP_MTU_PAYLOAD - 2) chunk = RTP_MTU_PAYLOAD - 2;
-            int last = (off + chunk >= nal_len);
-            uint8_t buf[RTP_MTU_PAYLOAD];
-            buf[0] = (uint8_t)(0x1C | nri); /* FU indicator: type 28 (FU-A) */
-            buf[1] = (uint8_t)((first ? 0x80 : 0) | (last ? 0x40 : 0) | nal_type);
-            memcpy(buf + 2, nal + off, chunk);
-            rtp_send_packet(c, buf, chunk + 2, rtp_ts, last && is_last_in_frame);
-            off += chunk;
-            first = 0;
+        if (n > 0)
+            c->rxlen += (size_t)n;
+        c->rxbuf[c->rxlen] = '\0';
+        drain_requests(srv, c);
+        if (c->rxlen >= sizeof(c->rxbuf) - 1)
+            c->rxlen = 0;
+        if (c->playing && c->tracks[RTSP_TRACK_METADATA].active && now >= c->next_metadata_us) {
+            send_metadata(srv, c);
+            c->next_metadata_us += METADATA_INTERVAL_US;
         }
+    }
+}
+
+static void cache_param_set(rtsp_server_t *srv, int s, const uint8_t *nal, size_t len)
+{
+    int type = nal[0] & 0x1f;
+    if ((type != NAL_SPS && type != NAL_PPS) || len > sizeof(srv->sps[0]))
+        return;
+    memcpy(type == NAL_SPS ? srv->sps[s] : srv->pps[s], nal, len);
+    *(type == NAL_SPS ? &srv->sps_len[s] : &srv->pps_len[s]) = len;
+}
+
+static void send_video_nal(rtsp_client_t *c, const uint8_t *nal, size_t len, uint32_t ts, int last)
+{
+    rtsp_track_t *t = &c->tracks[RTSP_TRACK_VIDEO];
+    if (len <= RTP_MAX_PAYLOAD) {
+        rtp_send(c, t, PT_H264, last, ts, NULL, 0, nal, len);
+        return;
+    }
+    uint8_t fu[2] = {(uint8_t)((nal[0] & 0xe0) | NAL_FU_A), (uint8_t)(0x80 | (nal[0] & 0x1f))};
+    for (size_t off = 1; off < len; off += FU_A_DATA) {
+        size_t chunk = len - off < FU_A_DATA ? len - off : FU_A_DATA;
+        int end = off + chunk == len;
+        if (end)
+            fu[1] |= 0x40;
+        rtp_send(c, t, PT_H264, last && end, ts, fu, 2, nal + off, chunk);
+        fu[1] &= 0x7f;
+    }
+}
+
+void rtsp_server_push_nal(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len,
+                          uint64_t pts_us, int is_last_in_frame)
+{
+    if (stream_id < 0 || stream_id >= RTSP_STREAM_COUNT || nal_len == 0)
+        return;
+    cache_param_set(srv, stream_id, nal, nal_len);
+    int type = nal[0] & 0x1f;
+    if (type == NAL_SEI)
+        return;
+    uint32_t ts = srv->video_ts_base[stream_id] + (uint32_t)(pts_us * 9u / 100u);
+    for (int i = 0; i < RTSP_MAX_CLIENTS; i++) {
+        rtsp_client_t *c = &srv->clients[i];
+        if (c->tcp_fd < 0 || !c->playing || c->stream_id != stream_id || !c->tracks[RTSP_TRACK_VIDEO].active)
+            continue;
+        if (c->waiting_for_sps) {
+            if (type != NAL_SPS)
+                continue;
+            c->waiting_for_sps = 0;
+        }
+        send_video_nal(c, nal, nal_len, ts, is_last_in_frame);
     }
 }
 
 void rtsp_server_close(rtsp_server_t *srv)
 {
-    for (int i = 0; i < RTSP_MAX_CLIENTS; i++) rtsp_client_reset(&srv->clients[i]);
-    if (srv->listen_fd >= 0) close(srv->listen_fd);
+    for (int i = 0; i < RTSP_MAX_CLIENTS; i++)
+        client_reset(&srv->clients[i]);
+    if (srv->listen_fd >= 0)
+        close(srv->listen_fd);
 }

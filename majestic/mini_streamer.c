@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -345,8 +346,14 @@ static void strip_start_code(const uint8_t *buf, size_t len, const uint8_t **nal
     *nal_len = len - off;
 }
 
-static int venc_get_stream(int enc_fd, int mem_fd, uint32_t chan,
-                            rtsp_server_t *rtsp, uint32_t rtp_ts)
+static uint64_t monotonic_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
+
+static int venc_get_stream(int enc_fd, int mem_fd, uint32_t chan, rtsp_server_t *rtsp)
 {
     venc_stream_t stream;
     memset(&stream, 0, sizeof(stream));
@@ -355,6 +362,7 @@ static int venc_get_stream(int enc_fd, int mem_fd, uint32_t chan,
         return -1;
     if (stream.pack_count == 0)
         return 0;
+    uint64_t pts_us = monotonic_us();
 
     for (uint32_t i = 0; i < stream.pack_count && i < VENC_MAX_PACKS; i++) {
         uint32_t phys = stream.packs[i].phys_addr;
@@ -372,11 +380,7 @@ static int venc_get_stream(int enc_fd, int mem_fd, uint32_t chan,
         const uint8_t *nal;
         size_t nal_len;
         strip_start_code(frame_bytes, len, &nal, &nal_len);
-        if (nal_len > 0) {
-            rtsp_server_set_param_set(rtsp, (int)chan, nal, nal_len);
-            int is_last = (i + 1 == stream.pack_count);
-            rtsp_server_send_nal(rtsp, (int)chan, nal, nal_len, rtp_ts, is_last);
-        }
+        rtsp_server_push_nal(rtsp, (int)chan, nal, nal_len, pts_us, i + 1 == stream.pack_count);
 
         munmap(map, len + page_off);
     }
@@ -450,6 +454,8 @@ int main(void)
         fprintf(stderr, "rtsp_server_init failed\n");
         return 1;
     }
+    for (size_t i = 0; i < VPSS_CHANNEL_COUNT; i++)
+        rtsp_server_enable_stream(&rtsp, (int)VPSS_CHANNELS[i].chan, 25);
     const char *rtsp_user = getenv("MINI_STREAMER_RTSP_USER");
     const char *rtsp_pass = getenv("MINI_STREAMER_RTSP_PASS");
     if (rtsp_user && rtsp_pass) {
@@ -457,13 +463,11 @@ int main(void)
         fprintf(stderr, "RTSP auth enabled (user: %s)\n", rtsp_user);
     }
 
-    fprintf(stderr, "Pipeline ready: rtsp://0.0.0.0:554/stream1 (main), "
-                     "rtsp://0.0.0.0:554/stream2 (sub). Raw H.264 for stream1 also on stdout.\n");
+    fprintf(stderr, "Pipeline ready: rtsp://0.0.0.0:554/stream=0 (main), "
+                     "rtsp://0.0.0.0:554/stream=1 (sub). Raw H.264 for stream=0 also on stdout.\n");
     fprintf(stderr, "Press Ctrl+C to stop\n");
 
     uint32_t frame_count = 0;
-    uint32_t rtp_ts[VPSS_CHANNEL_COUNT] = {0};
-    uint32_t chan_frame_count[VPSS_CHANNEL_COUNT] = {0};
     while (g_running) {
         rtsp_server_poll(&rtsp);
 
@@ -476,17 +480,10 @@ int main(void)
             if (ioctl(isp_fd, ISP_IOCTL_VPSS_GET_FRAME, frame) != 0)
                 continue;
 
-            int pack_count = venc_get_stream(enc_fd, isp_ctx.mem_fd, chan, &rtsp, rtp_ts[i]);
+            int pack_count = venc_get_stream(enc_fd, isp_ctx.mem_fd, chan, &rtsp);
             if (pack_count <= 0)
                 continue;
             any_frame = 1;
-
-            chan_frame_count[i]++;
-            if (chan_frame_count[i] % 25 == 0) {
-                rtsp_server_send_rtcp_sr(&rtsp, (int)chan, rtp_ts[i]);
-            }
-
-            rtp_ts[i] += 3600;
 
             if (chan == 0) {
                 frame_count++;

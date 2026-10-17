@@ -50,9 +50,9 @@ don't touch the access-safety question, which still needs real hardware to resol
 
 `majestic/mini_streamer.c` now wires the whole pipeline together — device opens, MIPI, VPSS
 (two channels), sensor I2C, buffer-address protocol, and the confirmed VENC layer (two channels)
-— plus a from-spec RTSP/RTP server (`majestic/rtsp_server.c`, RFC 2326 + RFC 6184, not decompiled
-from anything — there's no vendor RTSP logic to clean-room here) serving both streams live at
-`rtsp://<device-ip>:554/stream1` and `.../stream2`, with optional Basic auth. All of it builds
+— plus an RTSP/RTP server (`majestic/rtsp_server.c`) that reproduces OpenIPC majestic's RTSP output
+byte for byte (checked against real majestic by `tools/majestic-oracle/test.sh`), serving both streams
+at `rtsp://<device-ip>:554/stream=0` and `.../stream=1`, with optional Basic auth. All of it builds
 clean. One part is still a genuine open risk: the ISP register-table bring-up (~100+ raw
 `/dev/mem` writes) that was never resolved before this session either. The file's own header
 comments mark exactly which sections are hardware-proven, which are newly-derived-but-untested,

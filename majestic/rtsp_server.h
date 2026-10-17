@@ -6,36 +6,49 @@
 #include <netinet/in.h>
 
 #define RTSP_MAX_CLIENTS 8
-#define RTSP_STREAM_COUNT 2 /* stream1 = index 0 (main), stream2 = index 1 (sub) */
+#define RTSP_STREAM_COUNT 2
+#define RTSP_TRACK_VIDEO 0
+#define RTSP_TRACK_METADATA 1
+#define RTSP_TRACK_COUNT 2
 
 typedef struct {
-    int tcp_fd;
+    int active;
+    int interleaved;
+    uint8_t rtp_channel;
+    uint8_t rtcp_channel;
     int rtp_fd;
     int rtcp_fd;
     struct sockaddr_in rtp_addr;
     struct sockaddr_in rtcp_addr;
-    uint32_t session_id;
-    uint16_t seq;
     uint32_t ssrc;
-    int playing;
+    uint16_t seq;
+} rtsp_track_t;
+
+typedef struct {
+    int tcp_fd;
+    int loopback;
     int stream_id;
-    uint32_t pkt_count;
-    uint32_t octet_count;
-    int interleaved;        /* RTP/AVP/TCP (RFC 2326 S10.12) instead of UDP */
-    uint8_t rtp_channel;
-    uint8_t rtcp_channel;
-    char rxbuf[2048];
+    int has_session;
+    uint32_t session_id;
+    int playing;
+    int waiting_for_sps;
+    uint64_t next_metadata_us;
+    rtsp_track_t tracks[RTSP_TRACK_COUNT];
+    char rxbuf[4096];
     size_t rxlen;
 } rtsp_client_t;
 
 typedef struct {
     int listen_fd;
     rtsp_client_t clients[RTSP_MAX_CLIENTS];
-    uint8_t sps[RTSP_STREAM_COUNT][64];
+    int stream_enabled[RTSP_STREAM_COUNT];
+    unsigned fps[RTSP_STREAM_COUNT];
+    uint8_t sps[RTSP_STREAM_COUNT][128];
     size_t sps_len[RTSP_STREAM_COUNT];
-    uint8_t pps[RTSP_STREAM_COUNT][64];
+    uint8_t pps[RTSP_STREAM_COUNT][128];
     size_t pps_len[RTSP_STREAM_COUNT];
-    uint32_t next_session_id;
+    uint32_t video_ts_base[RTSP_STREAM_COUNT];
+    uint32_t metadata_ts_base;
     int auth_enabled;
     char auth_user[32];
     char auth_pass[32];
@@ -43,11 +56,10 @@ typedef struct {
 
 int rtsp_server_init(rtsp_server_t *srv, uint16_t port);
 void rtsp_server_set_credentials(rtsp_server_t *srv, const char *user, const char *pass);
+void rtsp_server_enable_stream(rtsp_server_t *srv, int stream_id, unsigned fps);
 void rtsp_server_poll(rtsp_server_t *srv);
-void rtsp_server_set_param_set(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len);
-void rtsp_server_send_nal(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len,
-                           uint32_t rtp_ts, int is_last_in_frame);
-void rtsp_server_send_rtcp_sr(rtsp_server_t *srv, int stream_id, uint32_t rtp_ts);
+void rtsp_server_push_nal(rtsp_server_t *srv, int stream_id, const uint8_t *nal, size_t nal_len,
+                          uint64_t pts_us, int is_last_in_frame);
 void rtsp_server_close(rtsp_server_t *srv);
 
 #endif
