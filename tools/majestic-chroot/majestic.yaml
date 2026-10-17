@@ -1,0 +1,97 @@
+system:
+  webPort: 80
+  httpsPort: 443
+  logLevel: debug
+isp:
+  antiFlicker: disabled
+image:
+  mirror: false
+  flip: false
+  rotate: 0
+  contrast: 50
+  hue: 50
+  saturation: 50
+  luminance: 50
+video0:
+  enabled: true
+  #codec: h265
+  fps: 20
+  rcMode: vbr
+  gopSize: 1
+video1:
+  enabled: false
+  #codec: h265
+  size: 704x576
+  fps: 15
+jpeg:
+  enabled: true
+  qfactor: 50
+  fps: 5
+osd:
+  enabled: false
+  template: '%d.%m.%Y %H:%M:%S'
+  # Font: the face and the three things that shape it.
+  font: /usr/share/fonts/truetype/UbuntuMono-Regular.ttf
+  size: "1.0"
+  weight: normal        # normal | thin
+  outline: true         # dark halo around each glyph
+  # Placement. Prefer anchor + offset: the offsets grow inward from the corner
+  # or edge you name, so top-left behaves the way a graphics API would.
+  #   anchor:  proportional | top-left | top | top-right | left | center
+  #            | right | bottom-left | bottom | bottom-right
+  #            ("auto" is still accepted as the old name for proportional)
+  #   offsetX/offsetY: 20 or 20px, or 2% of the frame, or 1.5em of the text
+  #            size. em is the one that lands in the same visual place on the
+  #            main stream, the sub stream and a snapshot alike. Anything else
+  #            is refused and logged.
+  anchor: proportional
+  offsetX: "0"
+  offsetY: "0"
+  # Used only while anchor is proportional: -16 is the far edge, 16 the near
+  # one. Superseded by anchor + offset.
+  posX: 16
+  posY: 16
+  bgAlpha: 25           # plate opacity, 0-100 per cent
+audio:
+  enabled: false
+  volume: 30
+  srate: 8000
+  codec: opus
+  outputEnabled: false
+  outputVolume: 30
+rtsp:
+  enabled: false
+  port: 554
+nightMode:
+  colorToGray: true
+  irCutSingleInvert: false
+  lightMonitor: false
+  lightSensorInvert: false
+motionDetect:
+  enabled: false
+  visualize: false
+  debug: false
+records:
+  enabled: false
+  path: /mnt/mmcblk0p1/%F
+  split: 20
+  maxUsage: 95
+watchdog:
+  enabled: false
+  timeout: 300
+hls:
+  enabled: false
+mdns:
+  # Answers mDNS queries for openipc.local. Turn off to hand :5353 to another
+  # responder on the camera — herald, or an avahi from a custom rootfs — which
+  # can publish the system hostname and DNS-SD service records this one cannot.
+  enabled: true
+onvif:
+  enabled: true
+  # Opt-in cleartext credentials for legacy 2014-era ONVIF clients that only
+  # speak WSSE PasswordDigest (e.g. ONVIF Device Manager v2.2.x) and for the
+  # spec-recommended HTTP Digest path. Leave password empty to keep the
+  # default behaviour (HTTP Basic + WSSE PasswordText via /etc/shadow only).
+  # SECURITY: when set, the password lives in this file as cleartext.
+  # username: root
+  # password: ""

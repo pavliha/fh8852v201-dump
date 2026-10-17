@@ -235,6 +235,27 @@ ffplay rtsp://<device-ip>:554/stream=0   # main, 1920x1080 (also raw H.264 on st
 ffplay rtsp://<device-ip>:554/stream=1   # sub, 800x576
 ```
 
+### Running the real majestic next to mini_streamer
+
+`tools/majestic-chroot/build.sh` packages the unmodified `majestic` from OpenIPC's fh8852v200 release
+(pinned by sha256) with that release's musl userland and `/var/www`, minus kernel modules, firmware
+and sensor libs. The eight Fullhan vendor libraries it links are replaced by one stub exporting its
+seven SDK symbols, which never get called. `/etc/majestic.yaml` turns its RTSP server and watchdog off,
+because mini_streamer owns `:554` and the pipeline. `tools/majestic-chroot/test.sh` boots the package
+under ARM emulation exactly as the camera would.
+
+```sh
+tools/majestic-chroot/build.sh        # out/majestic-chroot.tgz (~3.6 MB) + out/start-majestic.sh
+# copy both files to /tmp on the camera, start mini_streamer first, then:
+sh /tmp/start-majestic.sh /tmp/majestic-chroot.tgz
+```
+
+The chroot deliberately has no `/dev/i2c-*`. Once majestic finds a sensor, its `start_sdk` enters a
+channel loop the compiler left without an exit (file offsets `0xf9f0`–`0xfae4`); it writes past the end
+of `.bss` and crashes. Without a sensor it logs `Cannot start SDK` and keeps serving its web UI, API,
+`/metrics` and discovery. It never streams video on Fullhan either way: the only `FH_VENC_CreateChn`
+call is its JPEG snapshot. The default config has `system.telemetry: true`.
+
 ### Majestic's RTSP behaviour (from `tools/majestic-oracle`)
 
 Majestic's Fullhan port has no video path: its only SDK imports are `FH_SYS_BindVpu2Enc`,
