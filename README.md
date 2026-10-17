@@ -1206,18 +1206,48 @@ for (i = 0; i < 2; i++) {
 
 ### CV2003 Init Sequence (decompiled from FUN_0030de78)
 
+The vendor driver is `cv2003_mipi_sensor_if` (`0x5e0840`, returned by `Sensor_Create_CV2003_MIPI`).
+`API_ISP_SensorInit` calls slot 14 `SetLaneNumMax(2)` then slot 5 `Sensor_Init` (probe above, then
+`SensorDevice_Init`); `API_ISP_SetSensorFmt(fmt)` calls slot 8 `SetSensorFmt`; slot 9 `Sensor_Kick`
+is a no-op (`return 0`).
+
 ```c
+SensorDevice_Close();
+mirror = (fmt >> 16) & 1;
+SensorDevice_Init(addr >> 1, 2);
 puts("cv2003 20231011 1lane");
-// 1. Write register init table (varies by fps mode)
-for (i = 0; i < table_length; i++) {
-    Sensor_Write(table[i].addr, table[i].val);  // via I2C_RDWR ioctl
-}
-usleep(10000);  // 10ms settle time
-// 2. Enable streaming
-Sensor_Write(0x3141, 0x01);
-// 3. Read vertical cycle for frame rate
-v_cycle = (Sensor_Read(0x3021) << 8) | Sensor_Read(0x3020);
+idx = select_cfg(fmt);             // table @0x5e05ac, 4 x 20 bytes, needs cfg.lane_min <= lane_max
+mipi_init(cfg.ctrl_byte1, mirror, cfg.lanes);   // see below
+for (i = 0; i < cfg.count; i++)    // 52 regs, Sensor_Cfg_CV2003_MIPI_1080P25 @0x4c4bac
+    Sensor_Write(cfg.regs[i].addr, cfg.regs[i].val);
+usleep(10000);
+Sensor_Write(0x3141, 0x01);        // stream on
+v_cycle = Sensor_Read(0x3021) << 8;
+v_cycle |= Sensor_Read(0x3020);    // 0x0a8c = 2700 at 1080P25
+SetIntt(v_cycle / 2 - 5);          // 0x304a/0x3049/0x3048 = clamp(v_cycle - 2*intt, 8, v_cycle-4)
+SetGain(0x40);                     // 0x3804=0x10, 0x3154=idx in Tab_SensorRegToGain, 0x314d/0x314c
 ```
+
+| fmt | Table | Count | ctrl byte1 | lanes |
+|-----|-------|-------|------------|-------|
+| `0x201` | `Sensor_Cfg_CV2003_MIPI_1080P15` | 52 | `0x09` | 1 |
+| `0x202` | `Sensor_Cfg_CV2003_MIPI_1080P20` | 52 | `0x09` | 1 |
+| `0x203` | `Sensor_Cfg_CV2003_MIPI_1080P25` | 52 | `0x09` | 1 |
+| `0x204` | `Sensor_Cfg_CV2003_MIPI_1080P30` | 52 | `0x09` | 1 |
+
+`mipi_init` (`0x30ebbc`) opens `/dev/isp` `O_RDONLY` and issues, from one 8-byte stack buffer whose
+byte 0 is never written:
+
+| ioctl | Payload | isp.ko handler |
+|-------|---------|----------------|
+| `0x40066955` | `{_, mirror&1, (mirror>>1)&1, 1, 0, mirror}` | `mipiWrap_Init`: bits 0/1/2 from bytes 1/2/3, bits 12-13 from byte 5, bits 16-17 from byte 4, `\| 0x6800000` |
+| `0x40036954` | `{_, 0x09, 0x01}` | `mipiCtrl_Init`: byte 1 replicated into all 4 lanes at `mipi+0x28`, byte 2 = lane count (1-4) |
+
+Both handlers ignore byte 0. `sdk/tests/archive/test_minimal_regs.c` used `{0,1,0,0,0,0}` and
+`{0,8,1}` (bit 0 instead of bit 2, 8 instead of 9) and still got frames; `sdk/lib/cv2003_driver.c`
+now sends the vendor's values. `Tab_SensorRegToGain` (`0x5e060c`) is 250 `u16`s ending in `0xffff`;
+the vendor's search loop reads one entry past it, which only matters for gains above `0xffff`.
+`sdk/tests/test_cv2003_bus.c` pins the full 77-operation bus sequence against the vendor bytes.
 
 ### Key I2C Functions in ipcam Binary
 
@@ -1230,7 +1260,7 @@ v_cycle = (Sensor_Read(0x3021) << 8) | Sensor_Read(0x3020);
 | `I2CSensor_WriteEx` | `0x0030a21c` | Write with error suppression option |
 | `I2CSensor_WriteEx_Multi` | `0x0030a400` | Multi-register write |
 | `Sensor_Read` | `0x0030ab70` | High-level read (I2C or SPI) |
-| `Sensor_Write` | `0x0030ac20` | High-level write (I2C or SPI) |
+| `Sensor_Write` | `0x0030abc8` | High-level write (I2C or SPI) |
 | `p_i2c_read` | `0x002a2e4c` | Stub (returns -1) — unused |
 | `p_i2c_write` | `0x002a2e7c` | Stub (returns -1) — unused |
 

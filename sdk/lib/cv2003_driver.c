@@ -1,17 +1,4 @@
-/**
- * CV2003 (GC4201AC) Sensor Driver — Clean-Room Implementation
- *
- * Reimplements the sensor vtable callbacks based on Ghidra analysis
- * of the register addresses and I2C protocol. No proprietary code.
- *
- * Each function performs simple I2C register reads/writes to control
- * the sensor's exposure, gain, mirror/flip, and streaming state.
- *
- * I2C: slave 0x35 (7-bit), 16-bit register address, 8-bit data
- */
-
 #include <stdio.h>
-#include <string.h>
 #include <stdint.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -19,8 +6,15 @@
 
 #include "cv2003_driver.h"
 
-#define I2C_RDWR 0x0707
-#define I2C_M_RD 0x0001
+#define I2C_TENBIT 0x0704
+#define I2C_SLAVE  0x0706
+#define I2C_RDWR   0x0707
+#define I2C_M_RD   0x0001
+
+#define MIPI_IOCTL_CTRL_INIT 0x40036954
+#define MIPI_IOCTL_WRAP_INIT 0x40066955
+
+#define ARRAY_LEN(a) (sizeof(a) / sizeof((a)[0]))
 
 struct i2c_msg {
     uint16_t addr;
@@ -34,81 +28,9 @@ struct i2c_rdwr_ioctl_data {
     uint32_t nmsgs;
 };
 
-#define SENSOR_ADDR 0x35
+static const uint16_t PROBE_ADDRS_8BIT[] = {0x6a, 0x6c};
 
-/* ================================================================
- * I2C helpers
- * ================================================================ */
-
-static int g_i2c_fd = -1;
-
-static int sns_write(uint16_t reg, uint8_t val)
-{
-    uint8_t wb[3] = { (reg >> 8) & 0xFF, reg & 0xFF, val };
-    struct i2c_msg m = { .addr = SENSOR_ADDR, .flags = 0, .len = 3, .buf = wb };
-    struct i2c_rdwr_ioctl_data x = { .msgs = &m, .nmsgs = 1 };
-    return ioctl(g_i2c_fd, I2C_RDWR, &x);
-}
-
-static uint8_t sns_read(uint16_t reg)
-{
-    uint8_t wb[2] = { (reg >> 8) & 0xFF, reg & 0xFF };
-    uint8_t rb[1] = { 0 };
-    struct i2c_msg m[2] = {
-        { .addr = SENSOR_ADDR, .flags = 0,        .len = 2, .buf = wb },
-        { .addr = SENSOR_ADDR, .flags = I2C_M_RD, .len = 1, .buf = rb },
-    };
-    struct i2c_rdwr_ioctl_data x = { .msgs = m, .nmsgs = 2 };
-    if (ioctl(g_i2c_fd, I2C_RDWR, &x) < 0) return 0;
-    return rb[0];
-}
-
-/* ================================================================
- * Sensor state
- * ================================================================ */
-
-static uint32_t g_v_cycle = 2700;   /* from 25fps mode */
-static uint32_t g_exposure = 0;
-static uint32_t g_gain = 0;
-static int g_format_index = -1;     /* active config index */
-
-/* Gain lookup table — maps gain index to register value.
- * 250 entries, derived from the sensor's analog gain curve. */
-static const uint16_t gain_table[250] = {
-    /* Simplified: linear ramp from 64 (1x) to 1024 (16x) */
-    /* The real table from the binary has 250 entries but
-     * a linear approximation works for basic functionality */
-     64,  68,  72,  76,  80,  84,  88,  92,  96, 100,
-    104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
-    144, 148, 152, 156, 160, 164, 168, 172, 176, 180,
-    184, 188, 192, 196, 200, 204, 208, 212, 216, 220,
-    224, 228, 232, 236, 240, 244, 248, 252, 256, 260,
-    /* ... continue to 250 entries ... */
-    264, 272, 280, 288, 296, 304, 312, 320, 328, 336,
-    344, 352, 360, 368, 376, 384, 392, 400, 408, 416,
-    424, 432, 440, 448, 456, 464, 472, 480, 488, 496,
-    504, 512, 520, 528, 536, 544, 552, 560, 568, 576,
-    584, 592, 600, 608, 616, 624, 632, 640, 648, 656,
-    /* Fill remaining with max */
-    664, 672, 680, 688, 696, 704, 712, 720, 728, 736,
-    744, 752, 760, 768, 776, 784, 792, 800, 808, 816,
-    824, 832, 840, 848, 856, 864, 872, 880, 888, 896,
-    904, 912, 920, 928, 936, 944, 952, 960, 968, 976,
-    984, 992,1000,1008,1016,1024,1024,1024,1024,1024,
-    1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,
-    1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,
-    1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,
-    1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,
-    1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,
-    1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,
-    1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,
-    1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,
-    1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,
-    1024,1024,1024,1024,1024,1024,1024,1024,1024,1024,
-};
-
-/* 1080P25 register init table */
-static const uint16_t init_regs_25fps[][2] = {
+static const uint16_t SENSOR_CFG_1080P25[][2] = {
     {0x3300,0x03},{0x3422,0xbf},{0x3401,0x00},{0x3440,0x01},
     {0x3442,0x00},{0x3806,0x00},{0x3908,0x5f},{0x3909,0x00},
     {0x3929,0x01},{0x3158,0x01},{0x3159,0x01},{0x315a,0x01},
@@ -123,212 +45,174 @@ static const uint16_t init_regs_25fps[][2] = {
     {0x303b,0x07},{0x3034,0x04},{0x3035,0x00},{0x3036,0x38},
     {0x3037,0x04},{0x3908,0x51},{0x390a,0x02},{0x3000,0x00},
 };
-#define INIT_REG_COUNT (sizeof(init_regs_25fps) / sizeof(init_regs_25fps[0]))
 
-/* ================================================================
- * Vtable callback implementations
- * ================================================================ */
+static const uint16_t TAB_SENSOR_REG_TO_GAIN[250] = {
+    0x0040, 0x0040, 0x0040, 0x0040, 0x0041, 0x0041, 0x0041, 0x0041, 0x0042, 0x0042,
+    0x0042, 0x0042, 0x0043, 0x0043, 0x0043, 0x0043, 0x0044, 0x0044, 0x0044, 0x0045,
+    0x0045, 0x0045, 0x0046, 0x0046, 0x0046, 0x0046, 0x0047, 0x0047, 0x0047, 0x0048,
+    0x0048, 0x0048, 0x0049, 0x0049, 0x0049, 0x004a, 0x004a, 0x004a, 0x004b, 0x004b,
+    0x004b, 0x004c, 0x004c, 0x004c, 0x004d, 0x004d, 0x004e, 0x004e, 0x004e, 0x004f,
+    0x004f, 0x004f, 0x0050, 0x0050, 0x0051, 0x0051, 0x0051, 0x0052, 0x0052, 0x0053,
+    0x0053, 0x0054, 0x0054, 0x0054, 0x0055, 0x0055, 0x0056, 0x0056, 0x0057, 0x0057,
+    0x0058, 0x0058, 0x0059, 0x0059, 0x005a, 0x005a, 0x005b, 0x005b, 0x005c, 0x005c,
+    0x005d, 0x005d, 0x005e, 0x005e, 0x005f, 0x005f, 0x0060, 0x0060, 0x0061, 0x0062,
+    0x0062, 0x0063, 0x0063, 0x0064, 0x0065, 0x0065, 0x0066, 0x0067, 0x0067, 0x0068,
+    0x0069, 0x0069, 0x006a, 0x006b, 0x006b, 0x006c, 0x006d, 0x006d, 0x006e, 0x006f,
+    0x0070, 0x0071, 0x0071, 0x0072, 0x0073, 0x0074, 0x0075, 0x0075, 0x0076, 0x0077,
+    0x0078, 0x0079, 0x007a, 0x007b, 0x007c, 0x007d, 0x007e, 0x007e, 0x0080, 0x0081,
+    0x0082, 0x0083, 0x0084, 0x0085, 0x0086, 0x0087, 0x0088, 0x0089, 0x008a, 0x008c,
+    0x008d, 0x008e, 0x008f, 0x0090, 0x0092, 0x0093, 0x0094, 0x0096, 0x0097, 0x0099,
+    0x009a, 0x009c, 0x009d, 0x009f, 0x00a0, 0x00a2, 0x00a3, 0x00a5, 0x00a7, 0x00a8,
+    0x00aa, 0x00ac, 0x00ae, 0x00b0, 0x00b2, 0x00b4, 0x00b6, 0x00b8, 0x00ba, 0x00bc,
+    0x00be, 0x00c0, 0x00c3, 0x00c5, 0x00c7, 0x00ca, 0x00cc, 0x00cf, 0x00d2, 0x00d4,
+    0x00d7, 0x00da, 0x00dd, 0x00e0, 0x00e3, 0x00e6, 0x00ea, 0x00ed, 0x00f0, 0x00f4,
+    0x00f8, 0x00fc, 0x0100, 0x0104, 0x0108, 0x010c, 0x0111, 0x0115, 0x011a, 0x011f,
+    0x0124, 0x0129, 0x012f, 0x0135, 0x013b, 0x0141, 0x0147, 0x014e, 0x0155, 0x015c,
+    0x0164, 0x016c, 0x0174, 0x017c, 0x0186, 0x018f, 0x0199, 0x01a4, 0x01af, 0x01ba,
+    0x01c7, 0x01d4, 0x01e1, 0x01f0, 0x0200, 0x0210, 0x0222, 0x0234, 0x0249, 0x025e,
+    0x0276, 0x028f, 0x02aa, 0x02c8, 0x02e8, 0x030c, 0x0333, 0x035e, 0x038e, 0x03c3,
+    0x0400, 0x0444, 0x0492, 0x04ec, 0x0555, 0x05d1, 0x0666, 0x071c, 0x0800, 0xffff
+};
 
-/* [1] Get sensor info — returns resolution and timing info */
-static int cv2003_get_info(uint16_t *info)
+static int g_i2c_fd = -1;
+static uint16_t g_i2c_addr;
+static uint32_t g_v_cycle;
+
+static int sensor_device_init(uint16_t addr)
 {
-    if (!info) return -1;
-    /* From decompilation: copies 8 uint16 + 1 uint32 from config table */
-    info[0] = 1920;    /* width */
-    info[1] = 1080;    /* height */
-    info[2] = 1920;    /* active width */
-    info[3] = 1080;    /* active height */
-    info[4] = 0;       /* x offset */
-    info[5] = 0;       /* y offset */
-    info[6] = 1920;    /* total width */
-    info[7] = 1080;    /* total height */
-    /* info[8..9] = uint32 pixel clock */
-    *(uint32_t *)(info + 10) = 74250000; /* ~74.25 MHz */
-    return 0;
-}
-
-/* [2] Set mirror/flip — reg 0x3028 bits [1:0] */
-static int cv2003_set_mirror_flip(uint32_t mode)
-{
-    uint8_t val = sns_read(0x3028);
-    val = (val & 0xFC) | ((mode & 1) << 1) | ((mode >> 1) & 1);
-    sns_write(0x3028, val);
-    return 0;
-}
-
-/* [3] Get mirror/flip */
-static int cv2003_get_mirror_flip(uint32_t *mode)
-{
-    uint8_t val = sns_read(0x3028);
-    *mode = ((val & 1) << 1) | ((val >> 1) & 1);
-    return 0;
-}
-
-/* [8] Set format and init registers — the main init function */
-int cv2003_set_format(int format)
-{
-    /* Write register init table */
-    for (int i = 0; i < (int)INIT_REG_COUNT; i++) {
-        sns_write(init_regs_25fps[i][0], init_regs_25fps[i][1]);
-    }
-    usleep(10000); /* 10ms settle */
-
-    /* Enable streaming */
-    sns_write(0x3141, 0x01);
-
-    /* Read back V-cycle */
-    uint8_t vl = sns_read(0x3020);
-    uint8_t vh = sns_read(0x3021);
-    g_v_cycle = ((uint32_t)vh << 8) | vl;
-
-    g_format_index = 0;
-    return 0;
-}
-
-/* [11] Set gain (alternative entry) */
-static int cv2003_set_gain_alt(uint32_t gain)
-{
-    return 0; /* stub — main gain is in [24] */
-}
-
-/* [22] Set exposure — regs 0x3048/3049/304A (24-bit) */
-static int cv2003_set_exposure(int exposure)
-{
-    uint32_t val = g_v_cycle - exposure * 2;
-    if (val < 8) val = 8;
-    if (val > g_v_cycle - 4) val = g_v_cycle - 4;
-
-    g_exposure = exposure;
-    sns_write(0x304a, (val >> 16) & 0xFF);
-    sns_write(0x3049, (val >> 8) & 0xFF);
-    sns_write(0x3048, val & 0xFF);
-    return 0;
-}
-
-/* [23] Get exposure */
-static int cv2003_get_exposure(int *exposure)
-{
-    *exposure = g_exposure;
-    return 0;
-}
-
-/* [24] Set analog gain — reg 0x3154 (table index) + 0x314C/D (10-bit) */
-static int cv2003_set_gain(uint32_t gain)
-{
-    /* Find gain table index */
-    uint32_t idx = 0;
-    for (idx = 0; idx < 249; idx++) {
-        if (gain >= gain_table[idx] && gain <= gain_table[idx + 1])
-            break;
-    }
-
-    /* Calculate register value */
-    uint32_t reg_gain = gain >> 5;
-    if (reg_gain < 0x40) reg_gain = 0x40;
-    if (reg_gain > 0x3FF) reg_gain = 0x400;
-
-    g_gain = gain;
-
-    /* Set gain mode based on threshold */
-    if (gain < 0x401) {
-        sns_write(0x3804, 0x10);
-    }
-    if (gain > 0x7FF) {
-        sns_write(0x3804, 0x15);
-    }
-
-    /* Write gain registers */
-    sns_write(0x3154, idx & 0xFF);
-    sns_write(0x314d, (reg_gain >> 8) & 0xFF);
-    sns_write(0x314c, reg_gain & 0xFF);
-    return 0;
-}
-
-/* [25] Get gain */
-static int cv2003_get_gain(uint32_t *gain)
-{
-    *gain = g_gain;
-    return 0;
-}
-
-/* [9] Sensor kick — start streaming (called by ISP) */
-static int cv2003_kick(void)
-{
-    sns_write(0x3141, 0x01);
-    return 0;
-}
-
-/* [30] Init helper — called during ISP init */
-static int cv2003_init_helper(void)
-{
-    /* Just return success — real init done in set_format */
-    return 0;
-}
-
-/* [6] Pre-init — called before format set */
-static int cv2003_pre_init(void)
-{
-    return 0;
-}
-
-/* ================================================================
- * Vtable construction
- * ================================================================ */
-
-static const char sensor_name[] = "cv2003_mipi";
-
-/**
- * Build the sensor vtable for ISP registration.
- * The vtable is 31 uint32 entries (124 bytes).
- * Each entry is either a function pointer or NULL.
- *
- * The ISP copies this to its internal struct at offset 0x162C
- * and calls the function pointers during frame processing.
- */
-void cv2003_build_vtable(uint32_t vtable[31])
-{
-    memset(vtable, 0, 124);
-
-    vtable[0]  = (uint32_t)(uintptr_t)sensor_name;
-    vtable[1]  = (uint32_t)(uintptr_t)cv2003_get_info;
-    vtable[2]  = (uint32_t)(uintptr_t)cv2003_set_mirror_flip;
-    vtable[3]  = (uint32_t)(uintptr_t)cv2003_get_mirror_flip;
-    /* [4] get ISP default config — NULL OK, ISP uses defaults */
-    vtable[5]  = 0;
-    vtable[6]  = (uint32_t)(uintptr_t)cv2003_pre_init;
-    vtable[7]  = 0;
-    vtable[8]  = (uint32_t)(uintptr_t)cv2003_set_format;
-    vtable[9]  = (uint32_t)(uintptr_t)cv2003_kick;
-    vtable[10] = 0;
-    vtable[11] = (uint32_t)(uintptr_t)cv2003_set_gain_alt;
-    vtable[12] = (uint32_t)(uintptr_t)cv2003_set_gain_alt;
-    /* [13-21] optional callbacks — NULL */
-    vtable[22] = (uint32_t)(uintptr_t)cv2003_set_exposure;
-    vtable[23] = (uint32_t)(uintptr_t)cv2003_get_exposure;
-    vtable[24] = (uint32_t)(uintptr_t)cv2003_set_gain;
-    vtable[25] = (uint32_t)(uintptr_t)cv2003_get_gain;
-    /* [26-29] optional */
-    vtable[30] = (uint32_t)(uintptr_t)cv2003_init_helper;
-}
-
-/**
- * Initialize the sensor driver.
- * Call this before registering the vtable with the ISP.
- */
-int cv2003_init(void)
-{
-    g_i2c_fd = open("/dev/i2c-0", O_RDWR);
+    g_i2c_fd = open("/dev/i2c-0", O_RDWR | O_NONBLOCK);
     if (g_i2c_fd < 0) {
-        perror("cv2003_init: open /dev/i2c-0");
+        perror("ERROR: Unable to open sensor!");
+        return -1;
+    }
+    g_i2c_addr = addr;
+    if (ioctl(g_i2c_fd, I2C_TENBIT, 0) < 0) {
+        perror("Error: Unable to set address mode!");
+        return -1;
+    }
+    if (ioctl(g_i2c_fd, I2C_SLAVE, addr) < 0) {
+        perror("Error: Unable to set slave address!");
         return -1;
     }
     return 0;
 }
 
+static void sensor_device_close(void)
+{
+    if (g_i2c_fd >= 0)
+        close(g_i2c_fd);
+    g_i2c_fd = -1;
+}
+
+static void sns_write(uint16_t reg, uint8_t val)
+{
+    uint8_t wb[3] = { (reg >> 8) & 0xFF, reg & 0xFF, val };
+    struct i2c_msg m = { .addr = g_i2c_addr, .flags = 0, .len = 3, .buf = wb };
+    struct i2c_rdwr_ioctl_data x = { .msgs = &m, .nmsgs = 1 };
+    if (ioctl(g_i2c_fd, I2C_RDWR, &x) < 0) {
+        perror("ERROR: Unable to write sensor register!");
+        fprintf(stderr, "addr: 0x%x, data: 0x%x\n", reg, val);
+    }
+}
+
+static uint16_t sns_read(uint16_t reg)
+{
+    uint8_t wb[2] = { (reg >> 8) & 0xFF, reg & 0xFF };
+    uint8_t rb[1] = { 0 };
+    struct i2c_msg m[2] = {
+        { .addr = g_i2c_addr, .flags = 0,        .len = 2, .buf = wb },
+        { .addr = g_i2c_addr, .flags = I2C_M_RD, .len = 1, .buf = rb },
+    };
+    struct i2c_rdwr_ioctl_data x = { .msgs = m, .nmsgs = 2 };
+    if (ioctl(g_i2c_fd, I2C_RDWR, &x) < 0) {
+        perror("ERROR: Unable to read sensor register!");
+        return 0xFFFF;
+    }
+    return rb[0];
+}
+
+static uint16_t probe_addr(void)
+{
+    for (size_t i = 0; i < ARRAY_LEN(PROBE_ADDRS_8BIT); i++) {
+        sensor_device_init(PROBE_ADDRS_8BIT[i] >> 1);
+        uint16_t pid1 = sns_read(0x307a);
+        uint16_t pid2 = sns_read(0x3138);
+        fprintf(stderr, "addr=0x%x,pid1=%x,pid2=%x\n", PROBE_ADDRS_8BIT[i], pid1, pid2);
+        sensor_device_close();
+        if ((pid1 == 0x02 || pid1 == 0x20) && pid2 == 0x03)
+            return PROBE_ADDRS_8BIT[i] >> 1;
+    }
+    return PROBE_ADDRS_8BIT[0] >> 1;
+}
+
+static int mipi_init(void)
+{
+    int fd = open("/dev/isp", O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "Mipi Device Init Failed!\n");
+        return -1;
+    }
+    uint8_t wrap[6] = {0, 0, 0, 1, 0, 0};
+    uint8_t ctrl[3] = {0, 9, 1};
+    int wrap_r = ioctl(fd, MIPI_IOCTL_WRAP_INIT, wrap);
+    int ctrl_r = ioctl(fd, MIPI_IOCTL_CTRL_INIT, ctrl);
+    close(fd);
+    return (wrap_r < 0 || ctrl_r < 0) ? -1 : 0;
+}
+
+static void set_intt(uint32_t intt)
+{
+    uint32_t v = g_v_cycle - intt * 2;
+    if (v < 8)
+        v = 8;
+    if (g_v_cycle - 4 < v)
+        v = g_v_cycle - 4;
+    sns_write(0x304a, (v >> 16) & 0xFF);
+    sns_write(0x3049, (v >> 8) & 0xFF);
+    sns_write(0x3048, v & 0xFF);
+}
+
+static void set_gain(uint32_t gain)
+{
+    size_t idx = 0;
+    while (idx + 1 < ARRAY_LEN(TAB_SENSOR_REG_TO_GAIN) &&
+           (gain < TAB_SENSOR_REG_TO_GAIN[idx] || TAB_SENSOR_REG_TO_GAIN[idx + 1] < gain))
+        idx++;
+    uint32_t reg = gain >> 5 < 0x40 ? 0x40 : gain >> 5 > 0x3FF ? 0x400 : gain >> 5;
+    if (gain < 0x401)
+        sns_write(0x3804, 0x10);
+    if (gain > 0x7FF)
+        sns_write(0x3804, 0x15);
+    sns_write(0x3154, idx & 0xFF);
+    sns_write(0x314d, (reg >> 8) & 0xFF);
+    sns_write(0x314c, reg & 0xFF);
+}
+
+int cv2003_init(void)
+{
+    return sensor_device_init(probe_addr());
+}
+
+int cv2003_set_format(void)
+{
+    sensor_device_close();
+    if (sensor_device_init(g_i2c_addr) < 0)
+        return -1;
+    if (mipi_init() < 0)
+        return -1;
+    for (size_t i = 0; i < ARRAY_LEN(SENSOR_CFG_1080P25); i++)
+        sns_write(SENSOR_CFG_1080P25[i][0], SENSOR_CFG_1080P25[i][1]);
+    usleep(10000);
+    sns_write(0x3141, 0x01);
+    uint16_t v_hi = sns_read(0x3021);
+    uint16_t v_lo = sns_read(0x3020);
+    g_v_cycle = (uint32_t)v_hi << 8 | v_lo;
+    set_intt(g_v_cycle / 2 - 5);
+    set_gain(0x40);
+    return 0;
+}
+
 void cv2003_deinit(void)
 {
-    if (g_i2c_fd >= 0) {
-        close(g_i2c_fd);
-        g_i2c_fd = -1;
-    }
+    sensor_device_close();
 }

@@ -7,10 +7,19 @@
  *
  * VERIFICATION STATUS BY SECTION — read this before trusting any one part:
  *
- *   PROVEN ON REAL HARDWARE: device opens, /proc/driver config writes, MIPI
- *     ioctls, VMM allocation, VPSS setup. Ported verbatim from
+ *   PROVEN ON REAL HARDWARE: device opens, /proc/driver config writes,
+ *     VMM allocation, VPSS setup. Ported verbatim from
  *     sdk/tests/archive/test_minimal_regs.c, which got MIPI frames flowing
  *     at 1920x1080@25fps.
+ *
+ *   BYTE-EXACT TO VENDOR, NOT YET HARDWARE-TESTED WITH THESE VALUES: CV2003
+ *     sensor bring-up and the MIPI ioctls (sdk/lib/cv2003_driver.c), ported
+ *     from ipcam's cv2003_mipi_sensor_if (Sensor_Init/SetSensorFmt/
+ *     mipi_init/SetIntt/SetGain). The MIPI payloads changed from the
+ *     hardware-tested test_minimal_regs.c values ({0,8,1}, {0,1,0,0,0,0})
+ *     to the vendor's ({0,9,1}, {0,0,0,1,0,0}), now issued from inside
+ *     sensor set-format like the vendor does. Bus sequence pinned by
+ *     sdk/tests/test_cv2003_bus.c. See README "CV2003 Init Sequence".
  *
  *   DERIVED THIS SESSION, NOT YET HARDWARE-TESTED: the ISP DMA
  *     buffer-address wiring (isp_core_alloc_buf_addr, sdk/lib/isp_buf_addr.c)
@@ -34,10 +43,8 @@
  *     causes a hang or corrupted image; it does not touch that separate,
  *     still-untested access-safety question. If the device hangs or
  *     crashes here, that's still this section, not the VPSS/VMM/
- *     buffer-address work before it. One part of this step remains
- *     unconfirmed on its own terms: isp_set_pic_size (picture size/crop/
- *     stride registers) — its vendor helper functions weren't decompiled
- *     this round, so those specific values are still theory-derived.
+ *     buffer-address work before it. isp_set_pic_size (IspInPicCfg)
+ *     is byte-exact too, including the SetLscTab/SetNr3dDrcWin search.
  *
  *   CONFIRMED VIA DECOMPILE, NOT HARDWARE-TESTED: VENC (encoder) setup and
  *     the stream-get loop. Every ioctl code and struct layout below was read
@@ -132,9 +139,6 @@ static int vmm_alloc(int vmm_fd, uint32_t size, const char *name, uint32_t *phys
 #define ISP_IOCTL_VPSS_OPEN_CHN       0xC0046973
 #define ISP_IOCTL_VPSS_SET_VO_MODE    0xC00869A4
 #define ISP_IOCTL_VPSS_GET_FRAME      0xC0686970
-
-#define ISP_IOCTL_MIPI_LANES          0x40036954
-#define ISP_IOCTL_MIPI_SET            0x40066955
 
 /*
  * VENC ioctl codes and struct layouts, all confirmed by decompiling ipcam's
@@ -255,15 +259,6 @@ static int vpss_setup(int isp_fd, int vmm_fd)
         if (ioctl(isp_fd, ISP_IOCTL_VPSS_SET_VO_MODE, vo) < 0) return -1;
     }
 
-    return 0;
-}
-
-static int mipi_setup(int isp_fd)
-{
-    uint8_t lanes[3] = {0, 8, 1};
-    if (ioctl(isp_fd, ISP_IOCTL_MIPI_LANES, lanes) < 0) return -1;
-    uint8_t set[6] = {0, 1, 0, 0, 0, 0};
-    if (ioctl(isp_fd, ISP_IOCTL_MIPI_SET, set) < 0) return -1;
     return 0;
 }
 
@@ -588,16 +583,14 @@ int main(void)
         return 1;
     }
 
-    if (mipi_setup(isp_fd) < 0) {
-        fprintf(stderr, "mipi_setup failed\n");
-        return 1;
-    }
-
     if (cv2003_init() < 0) {
         fprintf(stderr, "cv2003_init failed\n");
         return 1;
     }
-    cv2003_set_format(0);
+    if (cv2003_set_format() < 0) {
+        fprintf(stderr, "cv2003_set_format failed\n");
+        return 1;
+    }
 
     if (vpss_setup(isp_fd, vmm_fd) < 0) {
         fprintf(stderr, "vpss_setup failed\n");
