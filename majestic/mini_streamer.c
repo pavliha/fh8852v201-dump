@@ -1,99 +1,3 @@
-/**
- * Minimal H.264 streamer for FH8852V201 + CV2003 — majestic replacement.
- *
- * No vendor SDK linkage (there's no .so to link against on this chip —
- * see ../PORTING_GUIDE.md). Every call here is either a direct ioctl on
- * the kernel modules, or one of the clean-room libraries in sdk/lib/.
- *
- * VERIFICATION STATUS BY SECTION — read this before trusting any one part:
- *
- *   PROVEN ON REAL HARDWARE: device opens, /proc/driver config writes,
- *     VMM allocation, VPSS setup. Ported verbatim from
- *     sdk/tests/archive/test_minimal_regs.c, which got MIPI frames flowing
- *     at 1920x1080@25fps.
- *
- *   BYTE-EXACT TO VENDOR, NOT YET HARDWARE-TESTED WITH THESE VALUES: CV2003
- *     sensor bring-up and the MIPI ioctls (sdk/lib/cv2003_driver.c), ported
- *     from ipcam's cv2003_mipi_sensor_if (Sensor_Init/SetSensorFmt/
- *     mipi_init/SetIntt/SetGain). The MIPI payloads changed from the
- *     hardware-tested test_minimal_regs.c values ({0,8,1}, {0,1,0,0,0,0})
- *     to the vendor's ({0,9,1}, {0,0,0,1,0,0}), now issued from inside
- *     sensor set-format like the vendor does. Bus sequence pinned by
- *     sdk/tests/test_cv2003_bus.c. See README "CV2003 Init Sequence".
- *
- *   DERIVED THIS SESSION, NOT YET HARDWARE-TESTED: the ISP DMA
- *     buffer-address wiring (isp_core_alloc_buf_addr, sdk/lib/isp_buf_addr.c)
- *     — every ioctl/offset/constant read off the decompiled vendor binary
- *     and kernel modules, not guessed. See
- *     sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md.
- *
- *   REGISTER VALUES CONFIRMED, ACCESS SAFETY STILL GENUINELY BLOCKED: the
- *     ISP register-table bring-up (sdk/lib/isp_init.c's isp_ispp_init/
- *     isp_ispf_init/isp_pkg_enable/isp_reset). As of 2026-10-17 every
- *     register offset and value these write is byte-exact from decompiling
- *     isp_startup_Ispp_Init/Ispf_Init/Isp_PkgEnable/isp_core_system_reset
- *     — no longer "derived from theory." The call order was also corrected
- *     to match the real isp_core_init (buffer-address allocation before
- *     this register table, not after — see isp_setup()'s own comment).
- *     What byte-exact values do NOT resolve: whether writing these
- *     registers via /dev/mem while isp.ko is loaded is safe at all — the
- *     memory-attribute-mismatch/IRQ-race risk documented in
- *     ISP_BUF_ADDR_PROTOCOL_V201.md, never settled before this session
- *     either. Getting the VALUES right reduces the chance a wrong value
- *     causes a hang or corrupted image; it does not touch that separate,
- *     still-untested access-safety question. If the device hangs or
- *     crashes here, that's still this section, not the VPSS/VMM/
- *     buffer-address work before it. isp_set_pic_size (IspInPicCfg)
- *     is byte-exact too, including the SetLscTab/SetNr3dDrcWin search.
- *
- *   CONFIRMED VIA DECOMPILE, NOT HARDWARE-TESTED: VENC (encoder) setup and
- *     the stream-get loop. Every ioctl code and struct layout below was read
- *     off ipcam's real _VENC_SysInit / _VENC_QueryChnMem / _VENC_CreateChn /
- *     _VENC_SetRCAttr / _VENC_StartRecvPic / _VENC_HandleStream /
- *     _VENC_ReleaseStream (ipcam dispatches to these through a per-channel
- *     function-pointer vtable, not direct ioctls — this code skips the
- *     vtable and calls the real ioctls those functions issue directly).
- *     One deliberate substitution: the vendor allocates VENC buffers from
- *     isp_core's shared VMM pool (buffer_malloc_withname); this code uses
- *     an independent vmm_alloc() per buffer instead, which is functionally
- *     equivalent (same VMM_IOCTL_ALLOC, same kernel-side accounting) but
- *     not byte-identical to the vendor's pool bookkeeping. Pulling encoded
- *     bytes out of the stream packs (mmap of /dev/mem at the reported phys
- *     addr) is this code's own addition — there's no vendor majestic path
- *     on this chip to decompile for that step, so it follows the same
- *     mmap pattern already used for ISP/VPSS DMA buffers. Each pack is
- *     assumed to be one complete H.264 NAL unit (addr/length/type triple)
- *     — this matches standard hardware-encoder convention and the pack
- *     struct's own shape, but it is an INFERENCE, not confirmed by decompile:
- *     FH_VENC_GetStream has no internal caller in this binary to check it
- *     against (xref search came up empty — either dynamic dispatch or dead
- *     code in this firmware build), so there's no vendor reference consumer
- *     to verify against.
- *
- *   FROM-SPEC, NOT DECOMPILED: the RTSP/RTP server (rtsp_server.c). Built
- *     directly from RFC 2326 and RFC 6184, deliberately without consulting
- *     majestic's or ipcam's own RTSP implementation — this is public
- *     protocol, not vendor logic, so there was nothing to clean-room here
- *     at all. Scope: two streams (main + sub), H.264/UDP only, optional
- *     Basic auth. See rtsp_server.h for the exact method/feature list.
- *
- *   SECOND CHANNEL (stream2/sub, 800x576): confirmed safe to generalize
- *     from decompile, not guessed — FH_VPSS_ChnInitMem/SetChnAttr/
- *     SetVOMode are all channel-indexed (checked "< 5" channels) and
- *     FH_VPSS_SysInitMem's own real init loops GET_CHN_SIZE/alloc/
- *     SET_CHN_ADDR over every channel with nonzero capability, which is
- *     the structure vpss_setup()/venc_chn_setup() follow. FH_VPSS_OpenChn
- *     and FH_VPSS_Enable take no channel argument at all — called once,
- *     not per channel, confirmed from decompile rather than assumed.
- *
- * Usage:
- *   echo V > /dev/watchdog   # magic close, disables watchdog
- *   killall ipcam
- *   ./mini_streamer
- *   # then: ffplay rtsp://<device-ip>:554/stream1   (main, 1920x1080)
- *   #       ffplay rtsp://<device-ip>:554/stream2   (sub, 800x576)
- */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -109,15 +13,11 @@
 #include "../sdk/lib/cv2003_driver.h"
 #include "rtsp_server.h"
 
-/* ---- proven VMM alloc ioctl, byte-for-byte from test_minimal_regs.c ---- */
 #define VMM_IOCTL_ALLOC 0xC0506D0A
 
 static int vmm_alloc(int vmm_fd, uint32_t size, const char *name, uint32_t *phys_out)
 {
-    /* Same ioctl and struct layout as isp_buf_addr.c's vmm_alloc_pool —
-       offset 8 = align, offset 12 = size, confirmed from vmm.ko's own
-       mmb_alloc (see ISP_BUF_ADDR_PROTOCOL_V201.md). Label left empty,
-       matching the real bytes read off ipcam (0x4d1698 is 4 zero bytes). */
+
     uint8_t req[80];
     memset(req, 0, sizeof(req));
     *(uint32_t *)(req + 8) = 0x1000;
@@ -128,7 +28,6 @@ static int vmm_alloc(int vmm_fd, uint32_t size, const char *name, uint32_t *phys
     return r;
 }
 
-/* ---- proven VPSS ioctl codes, same source ---- */
 #define ISP_IOCTL_VPSS_GET_SYS_SIZE   0xC0046966
 #define ISP_IOCTL_VPSS_SET_SYS_ADDR   0xC00C6964
 #define ISP_IOCTL_VPSS_GET_CHN_SIZE   0xC0106967
@@ -140,11 +39,6 @@ static int vmm_alloc(int vmm_fd, uint32_t size, const char *name, uint32_t *phys
 #define ISP_IOCTL_VPSS_SET_VO_MODE    0xC00869A4
 #define ISP_IOCTL_VPSS_GET_FRAME      0xC0686970
 
-/*
- * VENC ioctl codes and struct layouts, all confirmed by decompiling ipcam's
- * _VENC_* internals (see file header). All issued on /dev/enc's fd, not
- * /dev/isp's — VENC is a separate device node from ISP/VPSS on this chip.
- */
 #define ISP_IOCTL_VENC_SYS_GET_SIZE   0xC0085401
 #define ISP_IOCTL_VENC_SYS_SET_ADDR   0xC00C5400
 #define ISP_IOCTL_VENC_QUERY_CHN_MEM  0xC0145402
@@ -171,7 +65,6 @@ static void write_proc_config(const char *path, const char *value)
     close(fd);
 }
 
-/* Proven /proc/driver config writes — same values as test_minimal_regs.c. */
 static void apply_proc_config(void)
 {
     static const char *const cfg[][2] = {
@@ -195,16 +88,6 @@ static void apply_proc_config(void)
         write_proc_config(cfg[i][0], cfg[i][1]);
 }
 
-/*
- * Two channels: stream1 (main, 1920x1080) and stream2 (sub, 800x576 —
- * matches apply_proc_config's "cap_1_800_576"). Per-channel step ordering
- * and parameterization confirmed from FH_VPSS_SysInitMem/SetChnAttr/
- * SetVOMode (all channel-indexed, checked "< 5") and FH_VPSS_OpenChn
- * (no channel argument at all — called once, not per channel): the
- * real vendor init loops GET_CHN_SIZE/alloc/SET_CHN_ADDR over every
- * channel with nonzero capability before doing anything channel-attr
- * related, which is the structure this follows.
- */
 typedef struct {
     uint32_t chan;
     uint32_t width;
@@ -262,33 +145,13 @@ static int vpss_setup(int isp_fd, int vmm_fd)
     return 0;
 }
 
-/*
- * ISP bring-up. The ioctl prelude (everything up to and including 0x690A)
- * is ported verbatim from test_minimal_regs.c's proven sequence, NOT from
- * isp_core_init's exact decompiled order — those two don't fully agree
- * (test_minimal_regs.c's sequence is what's actually been run on hardware
- * without crashing; isp_core_init's is what the vendor binary does). After
- * 0x690A: isp_core_alloc_buf_addr (purely ioctl-mediated, no /dev/mem),
- * then isp_mmap + the register-table bring-up (isp_hw_init, STILL
- * UNRESOLVED — see file header), then isp_start_processing (PkgEnable).
- *
- * ORDER FIX (2026-10-17): previously isp_hw_init() (register writes) ran
- * BEFORE isp_core_alloc_buf_addr(). Decompiling isp_core_init's real
- * top-level sequence this session showed the opposite — buffer-address
- * allocation (`FUN_002da83c`, i.e. isp_core_alloc_buf_addr) runs before
- * isp_core_system_reset and the rest of the register-table bring-up, not
- * after. Swapped to match. This doesn't change isp_core_alloc_buf_addr's
- * own risk profile (still only ioctls, never /dev/mem) — it changes
- * which step happens first relative to the genuinely unresolved
- * register-table writes.
- */
 static int isp_setup(isp_ctx_t *isp_ctx, int isp_fd, int vmm_fd, uint32_t width, uint32_t height)
 {
     uint32_t zero2[2] = {0, 0};
     if (ioctl(isp_fd, 0x80086929, zero2) < 0) return -1;
 
     uint32_t scratch12[12] = {0};
-    ioctl(isp_fd, 0x80306926, scratch12); /* output unused, matches isp_core_get_buf_size */
+    ioctl(isp_fd, 0x80306926, scratch12);
 
     uint8_t stat_info[120] = {0};
     if (ioctl(isp_fd, 0x80786905, stat_info) < 0) return -1;
@@ -298,7 +161,7 @@ static int isp_setup(isp_ctx_t *isp_ctx, int isp_fd, int vmm_fd, uint32_t width,
     if (ioctl(isp_fd, 0x40046909, &one) < 0) return -1;
 
     uint32_t handshake = 0;
-    if (ioctl(isp_fd, 0x690A, &handshake) < 0) return -1; /* isp_start, confirmed benign */
+    if (ioctl(isp_fd, 0x690A, &handshake) < 0) return -1;
 
     if (ioctl(isp_fd, 0x4004690F, &one) < 0) return -1;
 
@@ -326,13 +189,6 @@ static int isp_setup(isp_ctx_t *isp_ctx, int isp_fd, int vmm_fd, uint32_t width,
     return 0;
 }
 
-/*
- * Exact 7-word layout confirmed from _VENC_CreateChn's local-variable frame:
- * ioctl(enc_fd, 0xc01c5403, &this) with chan/width/height/codec as passed
- * by FH_VENC_SetChnAttr, buf_phys/buf_virt/buf_size as allocated by the
- * caller (vendor pulls these from isp_core's shared VMM pool; this code
- * uses its own vmm_alloc() instead — see file header).
- */
 typedef struct {
     uint32_t chan;
     uint32_t buf_phys;
@@ -340,44 +196,36 @@ typedef struct {
     uint32_t buf_size;
     uint32_t width;
     uint32_t height;
-    uint32_t codec; /* 0 = H.264, 1 = H.265 */
+    uint32_t codec;
 } venc_create_chn_t;
 
-/*
- * 26-word (104-byte) layout confirmed from _VENC_SetRCAttr. The function is
- * a big switch on rc_mode (0-0xe) with a different field layout per mode;
- * this is mode 9's branch (bitrate-only CBR-ish mode — the simplest one
- * that needs no QP floor/ceiling tuning from the caller). Field names are
- * this code's own labels, not vendor names — the decompile gave offsets
- * and constants, not identifiers.
- */
 typedef struct {
-    uint32_t chan;        /* offset 0x00 */
-    uint32_t hw_rc_type;  /* offset 0x04 — fixed 2 for mode-9 */
-    uint32_t reserved0;   /* offset 0x08 — fixed 0 */
-    uint32_t bitrate_a;   /* offset 0x0c */
-    uint32_t param2_a;    /* offset 0x10 */
-    uint32_t bitrate_b;   /* offset 0x14 */
-    uint32_t bitrate_c;   /* offset 0x18 */
-    uint32_t bitrate_d;   /* offset 0x1c */
-    uint32_t param2_b;    /* offset 0x20 */
-    uint32_t param2_c;    /* offset 0x24 */
-    uint32_t size_marker; /* offset 0x28 — fixed 8 */
-    uint32_t max_bitrate_param; /* offset 0x2c — param_3[3] */
-    uint32_t zero0;       /* offset 0x30 */
-    uint32_t gop;         /* offset 0x34 — fixed 5 */
-    uint32_t enable;      /* offset 0x38 — fixed 1 */
-    uint32_t zero1;       /* offset 0x3c */
-    uint32_t qp_delta_max;/* offset 0x40 — fixed 200 */
-    uint32_t qp_min_a;    /* offset 0x44 — fixed 0x1e (30) */
-    uint32_t qp_max_a;    /* offset 0x48 — fixed 0x22 (34) */
-    uint32_t zero2;       /* offset 0x4c */
-    uint32_t qp_step;     /* offset 0x50 — fixed -2 */
-    uint32_t zero3;       /* offset 0x54 */
-    uint32_t qp_max_b;    /* offset 0x58 — fixed 0x20 (32) */
-    uint32_t qp_min_b;    /* offset 0x5c — fixed 0x1e (30) */
-    uint32_t bitrate_floor;/* offset 0x60 — fixed 2000 */
-    uint32_t bitrate_ceil;/* offset 0x64 — fixed 4000 */
+    uint32_t chan;
+    uint32_t hw_rc_type;
+    uint32_t reserved0;
+    uint32_t bitrate_a;
+    uint32_t param2_a;
+    uint32_t bitrate_b;
+    uint32_t bitrate_c;
+    uint32_t bitrate_d;
+    uint32_t param2_b;
+    uint32_t param2_c;
+    uint32_t size_marker;
+    uint32_t max_bitrate_param;
+    uint32_t zero0;
+    uint32_t gop;
+    uint32_t enable;
+    uint32_t zero1;
+    uint32_t qp_delta_max;
+    uint32_t qp_min_a;
+    uint32_t qp_max_a;
+    uint32_t zero2;
+    uint32_t qp_step;
+    uint32_t zero3;
+    uint32_t qp_max_b;
+    uint32_t qp_min_b;
+    uint32_t bitrate_floor;
+    uint32_t bitrate_ceil;
 } venc_rc_attr_mode9_t;
 
 static int venc_set_rc_attr(int enc_fd, uint32_t chan, uint32_t bitrate_kbps)
@@ -402,22 +250,16 @@ static int venc_set_rc_attr(int enc_fd, uint32_t chan, uint32_t bitrate_kbps)
     return ioctl(enc_fd, ISP_IOCTL_VENC_SET_RC_ATTR, &rc);
 }
 
-/*
- * GetStream request/response, confirmed from FH_VENC_GetStream's 105-word
- * stack buffer and _VENC_HandleStream's field writes (stream_type 4 = H.264
- * branch). req[0] is the channel on input; everything else is filled by
- * the kernel. Each pack entry is {phys_addr, length, pack_type}.
- */
 #define VENC_MAX_PACKS 20
 typedef struct {
-    uint32_t stream_type; /* [0]: 4 = H.264, 8 = H.265 */
-    uint32_t handle;      /* [1]: pass to ReleaseStream */
-    uint32_t seq;         /* [2] */
-    uint32_t field3;      /* [3] */
-    uint32_t field4;      /* [4] */
-    uint32_t field5;      /* [5] */
-    uint32_t field6;      /* [6] */
-    uint32_t pack_count;  /* [7] */
+    uint32_t stream_type;
+    uint32_t handle;
+    uint32_t seq;
+    uint32_t field3;
+    uint32_t field4;
+    uint32_t field5;
+    uint32_t field6;
+    uint32_t pack_count;
     struct {
         uint32_t phys_addr;
         uint32_t length;
@@ -426,14 +268,9 @@ typedef struct {
     uint32_t tail[0x50 - 8 - VENC_MAX_PACKS * 3];
 } venc_stream_t;
 
-/*
- * Sys-level VENC memory pool — once, not per channel. Mirrors _VENC_SysInit
- * exactly (confirmed from decompile): one shared pool set up before any
- * channel is created, same pattern as VPSS's SYS_GET_SIZE/SYS_SET_ADDR.
- */
 static int venc_sys_init(int enc_fd, int vmm_fd)
 {
-    uint32_t sys_query[2] = {0, 0}; /* [0] = size, [1] = cached flag */
+    uint32_t sys_query[2] = {0, 0};
     if (ioctl(enc_fd, ISP_IOCTL_VENC_SYS_GET_SIZE, sys_query) < 0) {
         perror("VENC_SYS_GET_SIZE");
         return -1;
@@ -454,7 +291,7 @@ static int venc_sys_init(int enc_fd, int vmm_fd)
 static int venc_chn_setup(int enc_fd, int vmm_fd, uint32_t chan, uint32_t width, uint32_t height,
                            uint32_t bitrate_kbps, uint32_t *buf_phys_out, uint32_t *buf_size_out)
 {
-    uint32_t chn_mem_req[5] = {chan, 0, width, height, 0}; /* [4] = codec, 0 = H.264 */
+    uint32_t chn_mem_req[5] = {chan, 0, width, height, 0};
     if (ioctl(enc_fd, ISP_IOCTL_VENC_QUERY_CHN_MEM, chn_mem_req) < 0) {
         perror("VENC_QUERY_CHN_MEM");
         return -1;
@@ -497,11 +334,6 @@ static int venc_chn_setup(int enc_fd, int vmm_fd, uint32_t chan, uint32_t width,
     return 0;
 }
 
-/*
- * Strip a leading Annex-B start code, if present. The "one pack = one NAL"
- * assumption (see file header) means this is defensive, not load-bearing —
- * if the hardware already hands back NALs without start codes, off stays 0.
- */
 static void strip_start_code(const uint8_t *buf, size_t len, const uint8_t **nal, size_t *nal_len)
 {
     size_t off = 0;
@@ -513,12 +345,6 @@ static void strip_start_code(const uint8_t *buf, size_t len, const uint8_t **nal
     *nal_len = len - off;
 }
 
-/*
- * One GetStream/ReleaseStream cycle. Pack addresses point into DMA memory,
- * not process memory — each pack is mmap'd from /dev/mem, written to stdout
- * (preserving the raw-H.264-on-stdout usage mode) and handed to the RTSP
- * server as one NAL, then unmapped, before the stream handle is released.
- */
 static int venc_get_stream(int enc_fd, int mem_fd, uint32_t chan,
                             rtsp_server_t *rtsp, uint32_t rtp_ts)
 {
@@ -655,13 +481,12 @@ int main(void)
                 continue;
             any_frame = 1;
 
-            /* RTCP SR once per second (~25 frames @ 25fps) per RFC 3550 6.4.1 */
             chan_frame_count[i]++;
             if (chan_frame_count[i] % 25 == 0) {
                 rtsp_server_send_rtcp_sr(&rtsp, (int)chan, rtp_ts[i]);
             }
 
-            rtp_ts[i] += 3600; /* 90000 Hz RTP clock / 25 fps */
+            rtp_ts[i] += 3600;
 
             if (chan == 0) {
                 frame_count++;

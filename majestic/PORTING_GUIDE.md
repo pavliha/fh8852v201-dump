@@ -208,3 +208,29 @@ while (running) {
 | `majestic.yaml` | Complete majestic config derived from live camera |
 | `sensor-cv2003_mipi-1080p.ini` | Sensor configuration for majestic |
 | `PORTING_GUIDE.md` | This file |
+
+## mini_streamer.c — Verification Status
+
+A standalone majestic replacement: every call is a direct ioctl on the kernel modules or one of
+the clean-room libraries in `sdk/lib/`. Read this before trusting any one part.
+
+| Section | Status |
+|---------|--------|
+| Device opens, `/proc/driver` config writes, VMM allocation, VPSS setup | **Proven on hardware.** Ported verbatim from `sdk/tests/archive/test_minimal_regs.c`, which got MIPI frames flowing at 1920x1080@25fps. |
+| CV2003 sensor bring-up + MIPI ioctls (`sdk/lib/cv2003_driver.c`) | **Byte-exact to vendor, not yet hardware-tested with these values.** Ported from ipcam's `cv2003_mipi_sensor_if` (`Sensor_Init`/`SetSensorFmt`/`mipi_init`/`SetIntt`/`SetGain`). MIPI payloads changed from the hardware-tested `{0,8,1}`/`{0,1,0,0,0,0}` to the vendor's `{0,9,1}`/`{0,0,0,1,0,0}`, issued from inside sensor set-format like the vendor. Bus sequence pinned by `sdk/tests/test_cv2003_bus.c`. See README "CV2003 Init Sequence". |
+| ISP DMA buffer-address wiring (`sdk/lib/isp_buf_addr.c`) | **Derived from decompile, not hardware-tested.** Every ioctl/offset/constant read off ipcam and the kernel modules. See `sdk/headers/ISP_BUF_ADDR_PROTOCOL_V201.md`. |
+| ISP register-table bring-up (`sdk/lib/isp_init.c`) | **Values byte-exact, access safety still blocked.** Offsets and values from `isp_startup_Ispp_Init`/`Ispf_Init`/`Isp_PkgEnable`/`isp_core_system_reset`, and `isp_set_pic_size` (`IspInPicCfg`) including the `SetLscTab`/`SetNr3dDrcWin` search. Whether writing these via `/dev/mem` while `isp.ko` is loaded is safe at all (memory-attribute mismatch / IRQ race, see `ISP_BUF_ADDR_PROTOCOL_V201.md`) is untested. If the device hangs here, it is this step, not the VPSS/VMM/buffer-address work before it. |
+| ISP ioctl prelude in `isp_setup()` (up to `0x690A`) | **Not vendor order.** Follows `test_minimal_regs.c`'s hardware-run sequence, which does not fully agree with `isp_core_init`'s decompiled order. After `0x690A` it follows the vendor: buffer-address allocation, then the register table (`isp_hw_init`), then `PkgEnable`. |
+| VENC setup and stream-get loop | **Confirmed via decompile, not hardware-tested.** Codes and layouts from `_VENC_SysInit`/`_QueryChnMem`/`_CreateChn`/`_SetRCAttr`/`_StartRecvPic`/`_HandleStream`/`_ReleaseStream`, called directly instead of through ipcam's per-channel vtable. See `sdk/headers/VENC_PROTOCOL_V201.md`. Two deviations: buffers come from one `vmm_alloc()` each instead of `isp_core`'s shared pool (`buffer_malloc_withname`), and each stream pack is assumed to be one complete NAL unit — an inference, since `FH_VENC_GetStream` has no caller in this binary to check against. Reading pack bytes via `/dev/mem` mmap is this code's own addition. |
+| Second channel (stream2, 800x576) | **Confirmed via decompile.** `FH_VPSS_ChnInitMem`/`SetChnAttr`/`SetVOMode` are channel-indexed (`< 5`); `FH_VPSS_SysInitMem` loops size/alloc/addr per channel; `FH_VPSS_OpenChn`/`Enable` take no channel and run once. |
+| RTSP/RTP server (`rtsp_server.c`) | **From spec, not decompiled.** RFC 2326/3550/6184: two H.264 streams, UDP and TCP-interleaved, RTCP SR, optional Basic auth (`MINI_STREAMER_RTSP_USER`/`PASS`). |
+
+### Usage
+
+```sh
+echo V > /dev/watchdog   # magic close, disables watchdog
+killall ipcam
+./mini_streamer
+ffplay rtsp://<device-ip>:554/stream1   # main, 1920x1080 (also raw H.264 on stdout)
+ffplay rtsp://<device-ip>:554/stream2   # sub, 800x576
+```
