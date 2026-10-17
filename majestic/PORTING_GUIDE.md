@@ -223,11 +223,13 @@ the clean-room libraries in `sdk/lib/`. Read this before trusting any one part.
 | ISP ioctl prelude in `isp_setup()` (up to `0x690A`) | **Not vendor order.** Follows `test_minimal_regs.c`'s hardware-run sequence, which does not fully agree with `isp_core_init`'s decompiled order. After `0x690A` it follows the vendor: buffer-address allocation, then the register table (`isp_hw_init`), then `PkgEnable`. |
 | VENC setup and stream-get loop | **Confirmed via decompile (ipcam + `enc.ko` + `media_process.ko`), not hardware-tested.** Per channel: `QueryChnMem`, `CreateChn`, channel config `0xC0485405` (registers the encoder as media object `(4, chan)`), `SetRCAttr`, VPSS→VENC bind `0xC0104D00` on `/dev/media_process`, `StartRecvPic(&chan)`. Frames come from `GetStream` on `/dev/media_process` with the H.264 type mask; the reply names the channel and carries a 1 MHz PTS; `ReleaseStream(&chan)`. Before 2026-10-17 this code had six bugs here (no channel config, no bind, wrong GetStream fd, mask and layout, release/start arguments); it could not have produced video. See `sdk/headers/VENC_PROTOCOL_V201.md`. Buffers still come from one `vmm_alloc()` each instead of `isp_core`'s shared pool. |
 | Second channel (stream=1, 800x576) | **Confirmed via decompile.** `FH_VPSS_ChnInitMem`/`SetChnAttr`/`SetVOMode` are channel-indexed (`< 5`); `FH_VPSS_SysInitMem` loops size/alloc/addr per channel; `FH_VPSS_OpenChn`/`Enable` take no channel and run once. |
-| RTSP/RTP server (`rtsp_server.c`) | **Byte-matched to majestic.** Cloned from real OpenIPC majestic (master+2a2e35c, 2026-10-16) run under QEMU by `tools/majestic-oracle`; `tools/majestic-oracle/test.sh` replays the same clip through `rtsp_server.c` and diffs every RTSP reply and RTP/RTCP packet against `fixtures/majestic.json`: both streams, TCP and UDP, two concurrent clients, auth from a non-loopback peer, and path edge cases. RTP timestamps come from the encoder PTS like majestic's. Optional Basic auth via `MINI_STREAMER_RTSP_USER`/`PASS`; majestic checks the system password instead. |
+| RTSP/RTP server (`rtsp_server.c`) | **Byte-matched to majestic.** Cloned from real OpenIPC majestic (master+2a2e35c, 2026-10-16) run under QEMU by `tools/majestic-oracle`; `tools/majestic-oracle/test.sh` replays the same clip through `rtsp_server.c` and diffs every RTSP reply and RTP/RTCP packet against `fixtures/majestic.json`: both streams, TCP and UDP, two concurrent clients, auth from a non-loopback peer, and path edge cases. RTP timestamps come from the encoder PTS like majestic's. Logins are checked against `/etc/shadow` with `crypt()` like majestic's, unless `MINI_STREAMER_RTSP_USER`/`PASS` override them. Encoder bitrate follows majestic's automatic formula (`majestic/majestic_bitrate.h`). |
 
 ### Usage
 
 ```sh
+gcc -O2 -static -o mini_streamer majestic/mini_streamer.c majestic/rtsp_server.c \
+    sdk/lib/isp_init.c sdk/lib/isp_buf_addr.c sdk/lib/cv2003_driver.c -lcrypt -lm   # ARMv7 gcc, libcrypt-dev
 echo V > /dev/watchdog   # magic close, disables watchdog
 killall ipcam
 ./mini_streamer
@@ -269,12 +271,13 @@ library (`fake_mpi.c`) that feeds `fixtures/input_1080p25_gop50.h264`. What it s
 - DESCRIBE on any path serves stream 0; SETUP of a missing stream is `404 Stream not found`; SDP carries an ONVIF metadata track (PT 107)
 - `stream=` is read like `atoi` (`1x` and `01` are 1, `abc` and no `stream=` are 0); indices 3 and up fall back to 0; a disabled index 0–2 is `404 Stream not found`; only stream 0's SDP carries the metadata track; SETUP treats any track name but `metadata` as video
 - A non-Basic `Authorization` gets `401 Basic authentication required`
-- Session ids are random positive 31-bit decimals, `;timeout=60`; PLAY answers `Range: npt=now-` with no RTP-Info and asks the encoder for an IDR (`RequestIDR(chn, instant=1)`)
+- Session ids are random positive 31-bit decimals, `;timeout=60`, but idle sessions never expire while the RTSP connection stays open (80 s without keepalives kept streaming over UDP and TCP); PLAY answers `Range: npt=now-` with no RTP-Info and asks the encoder for an IDR (`RequestIDR(chn, instant=1)`)
 - A session starts at the next SPS sent in-band; cached SPS/PPS are never injected; SEI NALs are dropped
 - 1200-byte RTP payloads, FU-A for larger NALs, marker on a frame's last packet, sequence from 0, random SSRC per track
 - RTP timestamp = (encoder PTS µs + a random per-process base µs) × 9 / 100, so the rounding phase differs per run
 - `/stream=-1` hangs majestic's whole RTSP server; mini_streamer treats it as stream 0 instead
 - No RTCP sender reports; TEARDOWN sends a BYE "session ended" per track (video first)
+- Automatic bitrate when `bitrate` is unset: `round64((fps·0.65/30 + 0.35) · r^(r<1 ? 1 : 0.75) · 4096)` kbit/s with `r = w·h / 1920·1080`, ×0.8 for H.265, ×2.5 for MJPEG, ×0.6 for CBR, at least 128 (1080p25 → 3648, 704×576@25 → 704)
 - Metadata track: one ONVIF `MetadataStream` per second, empty 22×18 motion grid (`zwA=`), wall-clock timestamps
 
 Regenerate the fixture with `tools/majestic-oracle/build.sh && tools/majestic-oracle/run.sh`, then

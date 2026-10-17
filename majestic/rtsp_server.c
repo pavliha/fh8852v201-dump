@@ -7,6 +7,7 @@
 #include <fcntl.h>
 #include <errno.h>
 #include <time.h>
+#include <crypt.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -275,6 +276,32 @@ static int ends_with(const char *s, const char *suffix)
     return n >= m && strcmp(s + n - m, suffix) == 0;
 }
 
+static int shadow_matches(const char *shadow_path, const char *user_pass)
+{
+    const char *colon = strchr(user_pass, ':');
+    if (!colon || colon == user_pass)
+        return 0;
+    size_t user_len = (size_t)(colon - user_pass);
+    FILE *f = fopen(shadow_path, "r");
+    if (!f)
+        return 0;
+    char line[256];
+    int ok = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, user_pass, user_len) != 0 || line[user_len] != ':')
+            continue;
+        char *hash = line + user_len + 1;
+        char *end = strchr(hash, ':');
+        if (end)
+            *end = '\0';
+        const char *computed = hash[0] && hash[0] != '!' && hash[0] != '*' ? crypt(colon + 1, hash) : NULL;
+        ok = computed && strcmp(computed, hash) == 0;
+        break;
+    }
+    fclose(f);
+    return ok;
+}
+
 static int auth_ok(rtsp_server_t *srv, rtsp_client_t *c, const char *req, const char *cseq)
 {
     if (!srv->auth_enabled || c->loopback)
@@ -293,7 +320,8 @@ static int auth_ok(rtsp_server_t *srv, rtsp_client_t *c, const char *req, const 
     char expected[80];
     snprintf(expected, sizeof(expected), "%s:%s", srv->auth_user, srv->auth_pass);
     base64_decode(auth + 6, decoded, sizeof(decoded));
-    if (strcmp(decoded, expected) != 0) {
+    int valid = srv->shadow_path[0] ? shadow_matches(srv->shadow_path, decoded) : strcmp(decoded, expected) == 0;
+    if (!valid) {
         reply(c, cseq, "401 Invalid credentials", challenge);
         return 0;
     }
@@ -487,6 +515,12 @@ void rtsp_server_set_credentials(rtsp_server_t *srv, const char *user, const cha
 {
     snprintf(srv->auth_user, sizeof(srv->auth_user), "%s", user);
     snprintf(srv->auth_pass, sizeof(srv->auth_pass), "%s", pass);
+    srv->auth_enabled = 1;
+}
+
+void rtsp_server_use_shadow(rtsp_server_t *srv, const char *shadow_path)
+{
+    snprintf(srv->shadow_path, sizeof(srv->shadow_path), "%s", shadow_path);
     srv->auth_enabled = 1;
 }
 

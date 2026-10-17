@@ -56,10 +56,12 @@ typedef struct {
     int auth_enabled;
     char auth_user[32];
     char auth_pass[32];
+    char shadow_path[64];
 } rtsp_server_t;
 
 int rtsp_server_init(rtsp_server_t *srv, uint16_t port);
 void rtsp_server_set_credentials(rtsp_server_t *srv, const char *user, const char *pass);
+void rtsp_server_use_shadow(rtsp_server_t *srv, const char *shadow_path);
 void rtsp_server_enable_stream(rtsp_server_t *srv, int stream_id, unsigned fps);
 void rtsp_server_on_idr_request(rtsp_server_t *srv, rtsp_idr_request_fn fn, void *ctx);
 void rtsp_server_poll(rtsp_server_t *srv);

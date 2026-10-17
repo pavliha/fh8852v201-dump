@@ -12,6 +12,7 @@
 #include "../sdk/lib/isp_buf_addr.h"
 #include "../sdk/lib/cv2003_driver.h"
 #include "rtsp_server.h"
+#include "majestic_bitrate.h"
 
 #define VMM_IOCTL_ALLOC 0xC0506D0A
 
@@ -451,7 +452,7 @@ int main(void)
     for (size_t i = 0; i < VPSS_CHANNEL_COUNT; i++) {
         const vpss_chn_desc_t *d = &VPSS_CHANNELS[i];
         uint32_t buf_phys = 0, buf_size = 0;
-        uint32_t bitrate_kbps = (d->chan == 0) ? 2048 : 512;
+        uint32_t bitrate_kbps = majestic_auto_bitrate_kbps(d->width, d->height, VENC_FPS);
         if (venc_chn_setup(enc_fd, vmm_fd, d->chan, d->width, d->height, bitrate_kbps,
                             &buf_phys, &buf_size) < 0) {
             fprintf(stderr, "venc_chn_setup failed for channel %u\n", d->chan);
@@ -473,7 +474,10 @@ int main(void)
     const char *rtsp_pass = getenv("MINI_STREAMER_RTSP_PASS");
     if (rtsp_user && rtsp_pass) {
         rtsp_server_set_credentials(&rtsp, rtsp_user, rtsp_pass);
-        fprintf(stderr, "RTSP auth enabled (user: %s)\n", rtsp_user);
+        fprintf(stderr, "RTSP auth: user %s from the environment\n", rtsp_user);
+    } else {
+        rtsp_server_use_shadow(&rtsp, "/etc/shadow");
+        fprintf(stderr, "RTSP auth: system accounts from /etc/shadow, like majestic\n");
     }
 
     fprintf(stderr, "Pipeline ready: rtsp://0.0.0.0:554/stream=0 (main), "

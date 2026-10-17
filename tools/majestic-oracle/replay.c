@@ -75,7 +75,7 @@ int main(int argc, char **argv)
         perror("rtsp_server_init");
         return 1;
     }
-    rtsp_server_set_credentials(&srv, "root", "12345");
+    rtsp_server_use_shadow(&srv, argc > 3 ? argv[3] : "shadow");
     rtsp_server_enable_stream(&srv, 0, 25);
     rtsp_server_enable_stream(&srv, 1, 25);
     fprintf(stderr, "replay: %d NALs, %d access units, RTSP on :554\n", g_nal_count, g_au_count);

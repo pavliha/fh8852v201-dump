@@ -8,8 +8,8 @@ NAME=rtsp-replay
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 docker run -d --name "$NAME" -v "$REPO":/repo:ro gcc:14 sh -c '
-gcc -O2 -Wall -Wextra -Werror -o /tmp/replay /repo/tools/majestic-oracle/replay.c /repo/majestic/rtsp_server.c &&
-exec /tmp/replay /repo/tools/majestic-oracle/fixtures/input_1080p25_gop50.h264' >/dev/null
+gcc -O2 -Wall -Wextra -Werror -o /tmp/replay /repo/tools/majestic-oracle/replay.c /repo/majestic/rtsp_server.c -lcrypt &&
+exec /tmp/replay /repo/tools/majestic-oracle/fixtures/input_1080p25_gop50.h264 1000000000 /repo/tools/majestic-oracle/fixtures/shadow' >/dev/null
 for _ in $(seq 1 120); do
     docker logs "$NAME" 2>&1 | grep -q 'RTSP on' && break
     [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" = true ] || { docker logs "$NAME"; exit 1; }
