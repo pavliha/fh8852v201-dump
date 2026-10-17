@@ -4,7 +4,6 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <signal.h>
-#include <time.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -38,7 +37,6 @@ static int vmm_alloc(int vmm_fd, uint32_t size, const char *name, uint32_t *phys
 #define ISP_IOCTL_VPSS_SET_CHN_ATTR   0xC00C696C
 #define ISP_IOCTL_VPSS_OPEN_CHN       0xC0046973
 #define ISP_IOCTL_VPSS_SET_VO_MODE    0xC00869A4
-#define ISP_IOCTL_VPSS_GET_FRAME      0xC0686970
 
 #define ISP_IOCTL_VENC_SYS_GET_SIZE   0xC0085401
 #define ISP_IOCTL_VENC_SYS_SET_ADDR   0xC00C5400
@@ -48,6 +46,21 @@ static int vmm_alloc(int vmm_fd, uint32_t size, const char *name, uint32_t *phys
 #define ISP_IOCTL_VENC_START_RECV_PIC 0xC0045407
 #define ISP_IOCTL_VENC_GET_STREAM     0xC1A04D05
 #define ISP_IOCTL_VENC_RELEASE_STREAM 0xC004540A
+#define ISP_IOCTL_VENC_SET_CHN_CONFIG 0xC0485405
+#define ISP_IOCTL_VENC_REQUEST_IDR    0xC004540B
+#define MEDIA_IOCTL_BIND              0xC0104D00
+
+#define MEDIA_OBJECT_VPU 2
+#define MEDIA_OBJECT_ENC 4
+#define VENC_STREAM_H264 4
+#define VENC_CODEC_H264 4
+#define VENC_PROFILE_MAIN 77
+#define VENC_INIT_QP 35
+#define VENC_FPS 25
+#define VENC_GOP_FRAMES 25
+#define VENC_STREAM_WORDS (0x1A0 / 4)
+#define VENC_STREAM_NALU_WORD 12
+#define VENC_STREAM_NALU_MAX ((0x170 - 0x30) / 16)
 
 static volatile int g_running = 1;
 
@@ -251,23 +264,6 @@ static int venc_set_rc_attr(int enc_fd, uint32_t chan, uint32_t bitrate_kbps)
     return ioctl(enc_fd, ISP_IOCTL_VENC_SET_RC_ATTR, &rc);
 }
 
-#define VENC_MAX_PACKS 20
-typedef struct {
-    uint32_t stream_type;
-    uint32_t handle;
-    uint32_t seq;
-    uint32_t field3;
-    uint32_t field4;
-    uint32_t field5;
-    uint32_t field6;
-    uint32_t pack_count;
-    struct {
-        uint32_t phys_addr;
-        uint32_t length;
-        uint32_t pack_type;
-    } packs[VENC_MAX_PACKS];
-    uint32_t tail[0x50 - 8 - VENC_MAX_PACKS * 3];
-} venc_stream_t;
 
 static int venc_sys_init(int enc_fd, int vmm_fd)
 {
@@ -320,13 +316,15 @@ static int venc_chn_setup(int enc_fd, int vmm_fd, uint32_t chan, uint32_t width,
         return -1;
     }
 
-    if (venc_set_rc_attr(enc_fd, chan, bitrate_kbps) < 0) {
-        perror("VENC_SET_RC_ATTR");
+    uint32_t config[18] = {chan, VENC_CODEC_H264, width, height, width, height, VENC_GOP_FRAMES,
+                           VENC_PROFILE_MAIN, VENC_INIT_QP, VENC_FPS | (1u << 16)};
+    if (ioctl(enc_fd, ISP_IOCTL_VENC_SET_CHN_CONFIG, config) < 0) {
+        perror("VENC_SET_CHN_CONFIG");
         return -1;
     }
 
-    if (ioctl(enc_fd, ISP_IOCTL_VENC_START_RECV_PIC) < 0) {
-        perror("VENC_START_RECV_PIC");
+    if (venc_set_rc_attr(enc_fd, chan, bitrate_kbps) < 0) {
+        perror("VENC_SET_RC_ATTR");
         return -1;
     }
 
@@ -346,47 +344,59 @@ static void strip_start_code(const uint8_t *buf, size_t len, const uint8_t **nal
     *nal_len = len - off;
 }
 
-static uint64_t monotonic_us(void)
+static int venc_bind_and_start(int mp_fd, int enc_fd, uint32_t chan)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+    uint32_t bind[4] = {MEDIA_OBJECT_VPU, chan, MEDIA_OBJECT_ENC, chan};
+    if (ioctl(mp_fd, MEDIA_IOCTL_BIND, bind) < 0) {
+        perror("MEDIA_BIND vpu->enc");
+        return -1;
+    }
+    if (ioctl(enc_fd, ISP_IOCTL_VENC_START_RECV_PIC, &chan) < 0) {
+        perror("VENC_START_RECV_PIC");
+        return -1;
+    }
+    return 0;
 }
 
-static int venc_get_stream(int enc_fd, int mem_fd, uint32_t chan, rtsp_server_t *rtsp)
+static void venc_request_idr(void *ctx, int stream_id)
 {
-    venc_stream_t stream;
-    memset(&stream, 0, sizeof(stream));
-    stream.stream_type = chan;
-    if (ioctl(enc_fd, ISP_IOCTL_VENC_GET_STREAM, &stream) < 0)
-        return -1;
-    if (stream.pack_count == 0)
-        return 0;
-    uint64_t pts_us = monotonic_us();
+    uint32_t chan = (uint32_t)stream_id;
+    ioctl(*(int *)ctx, ISP_IOCTL_VENC_REQUEST_IDR, &chan);
+}
 
-    for (uint32_t i = 0; i < stream.pack_count && i < VENC_MAX_PACKS; i++) {
-        uint32_t phys = stream.packs[i].phys_addr;
-        uint32_t len = stream.packs[i].length;
+static int venc_get_stream(int mp_fd, int enc_fd, int mem_fd, rtsp_server_t *rtsp)
+{
+    uint32_t st[VENC_STREAM_WORDS];
+    memset(st, 0, sizeof(st));
+    st[0] = VENC_STREAM_H264;
+    if (ioctl(mp_fd, ISP_IOCTL_VENC_GET_STREAM, st) != 0 || st[1] != VENC_STREAM_H264)
+        return 0;
+
+    uint32_t chan = st[3];
+    uint32_t nalu_count = st[4] < VENC_STREAM_NALU_MAX ? st[4] : VENC_STREAM_NALU_MAX;
+    uint64_t pts_us = (uint64_t)st[11] << 32 | st[10];
+    for (uint32_t i = 0; i < nalu_count; i++) {
+        const uint32_t *nalu = &st[VENC_STREAM_NALU_WORD + i * 4];
+        uint32_t phys = nalu[1];
+        uint32_t len = nalu[3];
         if (len == 0)
             continue;
         uint32_t page_off = phys & 0xFFF;
         void *map = mmap(NULL, len + page_off, PROT_READ, MAP_SHARED, mem_fd, phys & ~0xFFFUL);
         if (map == MAP_FAILED)
             continue;
-
-        const uint8_t *frame_bytes = (uint8_t *)map + page_off;
-        write(STDOUT_FILENO, frame_bytes, len);
-
+        const uint8_t *bytes = (uint8_t *)map + page_off;
+        if (chan == 0)
+            write(STDOUT_FILENO, bytes, len);
         const uint8_t *nal;
         size_t nal_len;
-        strip_start_code(frame_bytes, len, &nal, &nal_len);
-        rtsp_server_push_nal(rtsp, (int)chan, nal, nal_len, pts_us, i + 1 == stream.pack_count);
-
+        strip_start_code(bytes, len, &nal, &nal_len);
+        rtsp_server_push_nal(rtsp, (int)chan, nal, nal_len, pts_us, i + 1 == nalu_count);
         munmap(map, len + page_off);
     }
 
-    ioctl(enc_fd, ISP_IOCTL_VENC_RELEASE_STREAM, &stream.handle);
-    return (int)stream.pack_count;
+    ioctl(enc_fd, ISP_IOCTL_VENC_RELEASE_STREAM, &chan);
+    return 1;
 }
 
 int main(void)
@@ -447,6 +457,8 @@ int main(void)
             fprintf(stderr, "venc_chn_setup failed for channel %u\n", d->chan);
             return 1;
         }
+        if (venc_bind_and_start(mp_fd, enc_fd, d->chan) < 0)
+            return 1;
     }
 
     rtsp_server_t rtsp;
@@ -455,7 +467,8 @@ int main(void)
         return 1;
     }
     for (size_t i = 0; i < VPSS_CHANNEL_COUNT; i++)
-        rtsp_server_enable_stream(&rtsp, (int)VPSS_CHANNELS[i].chan, 25);
+        rtsp_server_enable_stream(&rtsp, (int)VPSS_CHANNELS[i].chan, VENC_FPS);
+    rtsp_server_on_idr_request(&rtsp, venc_request_idr, &enc_fd);
     const char *rtsp_user = getenv("MINI_STREAMER_RTSP_USER");
     const char *rtsp_pass = getenv("MINI_STREAMER_RTSP_PASS");
     if (rtsp_user && rtsp_pass) {
@@ -470,29 +483,12 @@ int main(void)
     uint32_t frame_count = 0;
     while (g_running) {
         rtsp_server_poll(&rtsp);
-
-        int any_frame = 0;
-        for (size_t i = 0; i < VPSS_CHANNEL_COUNT; i++) {
-            uint32_t chan = VPSS_CHANNELS[i].chan;
-            uint32_t frame[26];
-            memset(frame, 0, sizeof(frame));
-            frame[0] = chan;
-            if (ioctl(isp_fd, ISP_IOCTL_VPSS_GET_FRAME, frame) != 0)
-                continue;
-
-            int pack_count = venc_get_stream(enc_fd, isp_ctx.mem_fd, chan, &rtsp);
-            if (pack_count <= 0)
-                continue;
-            any_frame = 1;
-
-            if (chan == 0) {
-                frame_count++;
-                if (frame_count % 25 == 0) {
-                    fprintf(stderr, "Frames: %u (last GetStream: %d packs)\n", frame_count, pack_count);
-                }
-            }
+        if (!venc_get_stream(mp_fd, enc_fd, isp_ctx.mem_fd, &rtsp)) {
+            usleep(2000);
+            continue;
         }
-        if (!any_frame) usleep(10000);
+        if (++frame_count % 50 == 0)
+            fprintf(stderr, "Frames: %u\n", frame_count);
     }
 
     rtsp_server_close(&rtsp);

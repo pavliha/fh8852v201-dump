@@ -19,43 +19,33 @@ confirms all 3 of those codes were correct guesses, and surfaces the architectur
   (passed as the vtable dispatcher's first argument) — there is no per-channel fd.
 - Two sys-level ioctls (`0xc0085401`/`0xc00c5400`) exist for a shared VENC memory pool, same
   pattern as VPSS's `SET_SYS_ADDR`/`GET_SYS_SIZE`, and are **not** in `PORTING_GUIDE.md` at all.
-- `GetStream`'s real path is `FH_VENC_GetStream` → `_fh_sys_get_stream` → single ioctl
-  `0xc1a04d05` (confirmed identical to the guide's guess), then `fh_venc_handle_stream` →
-  `_VENC_HandleStream`, which copies the kernel's pack-list into the caller's output struct —
-  the output struct layout below was never previously derived at all.
+- `GetStream` is a sys-level ioctl: `FH_VENC_GetStream(type_mask, out)` → `_fh_sys_get_stream` →
+  `0xc1a04d05` on `/dev/media_process`, then `_VENC_HandleStream` converts the raw reply into
+  `FH_VENC_STREAM`. Its first argument is a stream-type mask, not a channel (see below).
 
 ## Call sequence
 
 ```
-fh_enc_init()
-  fh_dev_open(g_enc, "/dev/enc")          // one shared fd for all channels
+open("/dev/enc"), open("/dev/media_process")
 
-_VENC_SysInit(g_enc)                       // once, before any channel
-  ioctl(enc_fd, 0xc0085401, &{size, cached})      // GET_SYS_SIZE
-  buffer_malloc_withname(size, align=8, "venc-sys")  // vendor: shared VMM pool; this code: own vmm_alloc
-  ioctl(enc_fd, 0xc00c5400, &{phys, 0, size})     // SET_SYS_ADDR
+_VENC_SysInit                                  // once
+  ioctl(enc, 0xc0085401, {size, cached})       // GET_SYS_SIZE
+  ioctl(enc, 0xc00c5400, {phys, 0, size})      // SET_SYS_ADDR
 
-_VENC_QueryChnMem(g_enc, chan, width, height, codec, &size_out)
-  ioctl(enc_fd, 0xc0145402, &{chan, <out:size>, width, height, codec})  // QUERY_CHN_MEM
+per channel:
+  ioctl(enc, 0xc0145402, {chan, <size>, w, h, codec})              // QUERY_CHN_MEM
+  ioctl(enc, 0xc01c5403, {chan, phys, virt, size, w, h, codec})    // CREATE_CHN
+  ioctl(enc, 0xc0485405, channel config)                           // SET_CHN_CONFIG, registers object (4, chan)
+  ioctl(enc, 0xc06c540c, rc)                                       // SET_RC_ATTR
+  ioctl(media, 0xc0104d00, {2, vpu_chan, 4, chan})                 // FH_SYS_BindVpu2Enc
+  ioctl(enc, 0xc0045407, &chan)                                    // START_RECV_PIC
 
-_VENC_CreateChn(g_enc, chan, width, height, codec, buf_phys, buf_virt, buf_size)
-  ioctl(enc_fd, 0xc01c5403, &{chan, buf_phys, buf_virt, buf_size, width, height, codec})  // 28 bytes
+per frame:
+  ioctl(media, 0xc1a04d05, {4 /* H.264 mask */, ...})              // GET_STREAM, any channel
+  ioctl(enc, 0xc004540a, &reply_chan)                              // RELEASE_STREAM
 
-_VENC_SetRCAttr(g_enc, chan, rc_params)
-  ioctl(enc_fd, 0xc06c540c, &rc_struct)    // 104 bytes, layout depends on rc_mode (see below)
-
-_VENC_StartRecvPic(g_enc)
-  ioctl(enc_fd, 0xc0045407)                // no struct argument at all
-
-// per frame:
-FH_VENC_GetStream(chan, out_buf)
-  _fh_sys_get_stream({chan})
-    ioctl(enc_fd, 0xc1a04d05, &{chan, ...})   // request word[0]=chan; response per layout below
-  fh_venc_handle_stream(...)
-    _VENC_HandleStream(...)                   // builds out_buf from the raw ioctl response
-
-_VENC_ReleaseStream(handle)
-  ioctl(enc_fd, 0xc004540a, &handle)
+on demand:
+  ioctl(enc, 0xc004540b, &chan)                                    // REQUEST_IDR
 ```
 
 ## `CreateChn` struct — `0xC01C5403`, 28 bytes
@@ -93,52 +83,57 @@ Other modes (0,2,5,7,8,10,11,12,13,14) map to CBR/fixed-QP/other RC strategies w
 caller-parameter counts (seen up to `param_3[0x10]`, i.e. 17 input words for mode 6/0xd/0xe) —
 not needed for this project and not transcribed here.
 
-## `GetStream` request/response — `0xC1A04D05`
+## `GetStream` request/response — `0xC1A04D05` (corrected 2026-10-17)
 
-Request is minimal: word[0] = channel id. The kernel fills the rest of the same buffer in place
-(confirmed from `FH_VENC_GetStream`'s 105-word stack buffer and `_VENC_HandleStream`'s field
-writes, H.264 branch — stream type 4):
+The earlier version of this section described `FH_VENC_STREAM`, the struct `_VENC_HandleStream`
+builds for callers, not the raw ioctl buffer. The raw layout below comes from `media_process.ko`
+(`media_ioctl` → `media_query_stream` → `media_driver_query`) and `enc.ko` (`hhe_fw_get_result`,
+which queues `channel + 0xf88` as the per-frame record), cross-checked against how ipcam's
+`_VENC_HandleStream` reads it.
 
-| Word(s)   | Field                                                      |
-|-----------|--------------------------------------------------------------|
-| `[0]`     | stream type on output (4 = H.264, 8 = H.265)                 |
-| `[1]`     | stream/buffer handle — pass to `ReleaseStream`                |
-| `[2]`     | nonzero iff a stream is actually available                    |
-| `[3]`,`[4]`,`[5]`,`[6]` | additional per-stream fields (not needed by this project) |
-| `[7]`     | pack count                                                     |
-| `[8..]`   | pack array, 3 words each: `{phys_addr, length, pack_type}`     |
-| `[0x44..0x4f]` | trailing stats (resolution, frame rate/100.0 as float, etc.) |
+- Issued on `/dev/media_process` (ipcam's `g_sys`), not `/dev/enc`. `0xC1A04D06` is the same call
+  with a 100 ms wait (`FH_VENC_GetStream_Block`).
+- Word 0 is a **stream-type mask**, not a channel: 1 = JPEG, 2 = MJPEG, 4 = H.264, 8 = H.265. One
+  call returns the next frame of any channel of that type; the reply says which channel.
+- The kernel writes the matching type to word 1 and copies the 0x198-byte record from word 2.
 
-If `[2]` is 0, no stream is available and `ReleaseStream` is called internally with no data
-returned — callers should treat a zero pack count the same way.
+| Word | Field |
+|------|-------|
+| 0 | in: stream-type mask |
+| 1 | out: stream type (4 / 8) |
+| 2 | record type (same) |
+| 3 | encoder channel — pass `&channel` to `ReleaseStream` |
+| 4 | NAL count |
+| 5 | frame type |
+| 6 | stream buffer physical base |
+| 7 | stream buffer app virtual base (from `CreateChn`'s `buf_virt`) |
+| 8 | frame size in bytes |
+| 10, 11 | PTS, 64-bit, low word first, microseconds (`pts_clk` is 1 MHz on this camera) |
+| 12.. | NAL entries, 4 words each: `{flag (1 for H.264), phys, app vaddr, length}` (at most 20 before the stats block at byte 0x170) |
 
-**Kernel-side readiness mechanism (2026-10-17 addendum, confirmed via `media_process.ko` /
-`enc.ko`, both unstripped):** `ipcam`'s `hhe_h264_query_stream`/`hhe_h265_query_stream` wrappers
-(in `enc.ko`) call `media_stream_query(4, ...)` (in `media_process.ko`), which forwards to
-`enc_stream_query`:
+## Channel config — `0xC0485405`, 72 bytes
 
-```c
-undefined4 enc_stream_query(int *param_1, void *param_2)
-{
-    if (*param_1 != param_1[1]) {
-        memcpy(param_2, param_1 + *param_1 * 0x66 + 4, 0x198);
-        return 1;
-    }
-    return 0;
-}
-```
+`_VENC_SetChnAttr` sends this between `CreateChn` and `SetRCAttr`; `enc.ko`'s
+`hhe_set_chn_config` handles it and registers the channel as media object `(4, channel)`, which
+is what makes it bindable. Without it the channel never encodes.
 
-This is a plain ring buffer: `param_1[0]`/`param_1[1]` are read/write indices, and each queued
-entry is a fixed 408-byte (`0x198`) record. This confirms the "stream ready" signal `[2]` above
-is backed by a real queue, not a flaky polling flag. It does **not** resolve whether the DMA
-bitstream bytes at each pack's `phys_addr` carry an Annex-B start code — this ring buffer is a
-separate metadata queue, not the bitstream payload itself, and no further static reference
-exists in this firmware build to check that against (see `mini_streamer.c`'s file header: this
-stays a flagged inference, defensively handled, not a confirmed fact).
+| Word | Field |
+|------|-------|
+| 0 | channel |
+| 1 | codec: 4 = H.264, 8 = H.265 |
+| 2, 3 | width, height |
+| 4, 5 | width, height again |
+| 6 | GOP in frames (must be nonzero) |
+| 7 | profile: 66 / 77 / 100 for H.264, 1 for H.265 |
+| 8 | initial QP (ipcam: 35, must be < 52) |
+| 9 | frame count \| frame time << 16 (ipcam: `25 \| 1 << 16`) |
+| 10–17 | 0 |
 
-## `ReleaseStream` — `0xC004540A`
+## Bind VPSS → VENC — `0xC0104D00` on `/dev/media_process`
 
-`ioctl(enc_fd, 0xc004540a, &handle)` where `handle` is the word read back at `GetStream`'s
-offset `[1]`. Preceded internally by a cache-flush call (`_VENC_FLUSH_CACHE`) on the vendor
-side — not replicated here since this project reads the pack data via an `/dev/mem` mmap
-(uncached by nature of the mapping), not via a cached virtual pointer the vendor code expects.
+`FH_SYS_BindVpu2Enc(vpu_chan, enc_chan)` → `{2 /* VPU object */, vpu_chan, 4 /* encoder object */, enc_chan}`.
+
+## `StartRecvPic` / `RequestIDR` / `ReleaseStream`
+
+All three take `&channel` on `/dev/enc`: `0xC0045407`, `0xC004540B`, `0xC004540A`.
+
